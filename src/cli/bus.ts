@@ -4,7 +4,8 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
@@ -13,6 +14,7 @@ import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunity
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
+import { updateCronFire } from '../bus/cron-state.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { resolvePaths } from '../utils/paths.js';
@@ -20,7 +22,43 @@ import { resolveEnv } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { logOutboundMessage, cacheLastSent } from '../telegram/logging.js';
-import type { Priority, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus } from '../types/index.js';
+import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext } from '../types/index.js';
+
+/**
+ * Check if the org requires deliverables and the task has none attached.
+ * Returns an error message if the transition should be blocked, or null if allowed.
+ */
+function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org: string, taskDir: string): string | null {
+  // Read org context to check require_deliverables setting
+  const contextPath = join(frameworkRoot, 'orgs', org, 'context.json');
+  if (!existsSync(contextPath)) return null;
+
+  let ctx: OrgContext;
+  try {
+    ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
+  } catch {
+    return null; // cannot read config — allow the transition
+  }
+
+  if (!ctx.require_deliverables) return null;
+
+  // Check if the task has outputs
+  const taskFile = join(taskDir, `${taskId}.json`);
+  if (!existsSync(taskFile)) return null;
+
+  let task: Task;
+  try {
+    task = JSON.parse(readFileSync(taskFile, 'utf-8'));
+  } catch {
+    return null;
+  }
+
+  if (!task.outputs || task.outputs.length === 0) {
+    return `Cannot submit task ${taskId}: require_deliverables is enabled but this task has no file deliverables attached. Use "cortextos bus save-output ${taskId} <file>" to attach a deliverable first.`;
+  }
+
+  return null;
+}
 
 export const busCommand = new Command('bus')
   .description('Bus commands for agent messaging, tasks, and events');
@@ -73,6 +111,9 @@ busCommand
     }
 
     const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo);
+    try {
+      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }));
+    } catch { /* non-fatal */ }
     console.log(msgId);
   });
 
@@ -92,6 +133,9 @@ busCommand
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     ackInbox(paths, id);
+    try {
+      logEvent(paths, env.agentName, env.org, 'message', 'inbox_ack', 'info', JSON.stringify({ msg_id: id }));
+    } catch { /* non-fatal */ }
     console.log(`ACK'd ${id}`);
   });
 
@@ -103,17 +147,29 @@ busCommand
   .option('--priority <p>', 'Priority (urgent, high, normal, low)', 'normal')
   .option('--project <name>', 'Project name')
   .option('--needs-approval', 'Require human approval before execution')
-  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean }) => {
+  .option('--blocked-by <ids>', 'Comma-separated task IDs that must complete before this task can progress')
+  .option('--blocks <ids>', 'Comma-separated task IDs that this new task will block (symmetric reverse edge)')
+  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
     const taskId = createTask(paths, env.agentName, env.org, title, {
       description: opts.desc,
       assignee: opts.assignee,
       priority: opts.priority as Priority,
       project: opts.project,
       needsApproval: opts.needsApproval ?? false,
+      blockedBy: parseList(opts.blockedBy),
+      blocks: parseList(opts.blocks),
     });
     console.log(taskId);
+    // Auto-notify assignee so the task is visible immediately (issue #78)
+    if (opts.assignee && opts.assignee !== env.agentName) {
+      const assigneePaths = resolvePaths(opts.assignee, env.instanceId, env.org);
+      const desc = opts.desc ? ` — ${opts.desc.slice(0, 120)}` : '';
+      sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
+        `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`);
+    }
   });
 
 busCommand
@@ -128,8 +184,107 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+
+    // Guard: block review/completion when deliverables are required but missing.
+    // Checks both ready_for_review (approval workflow) and completed (vanilla upstream)
+    // so the validator works regardless of which status set is installed.
+    if ((status === 'ready_for_review' || status === 'completed') && env.org) {
+      const err = checkDeliverableRequirement(id, env.frameworkRoot, env.org, paths.taskDir);
+      if (err) {
+        console.error(err);
+        process.exit(1);
+      }
+    }
+
     updateTask(paths, id, status as TaskStatus);
     console.log(`Updated ${id} -> ${status}`);
+  });
+
+busCommand
+  .command('compact-tasks')
+  .description('Archive completed tasks older than N days into a per-month archive-YYYY-MM.jsonl and remove them from the active list — preserves audit logs, skips tasks still needed as blockers')
+  .option('--older-than <days>', 'Cutoff in days (default: 30)', '30')
+  .option('--dry-run', 'Report what would be compacted without modifying anything')
+  .action((opts: { olderThan: string; dryRun?: boolean }) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const olderThanDays = parseInt(opts.olderThan, 10);
+    if (isNaN(olderThanDays) || olderThanDays < 0) {
+      console.error('--older-than must be a non-negative integer');
+      process.exit(1);
+    }
+    const report = compactTasks(paths, { olderThanDays, dryRun: opts.dryRun });
+    const verb = report.dry_run ? 'would compact' : 'compacted';
+    console.log(`${verb} ${report.archived.length} task${report.archived.length === 1 ? '' : 's'}, skipped ${report.skipped.length}`);
+    for (const a of report.archived) console.log(`  ✓ ${a.id}  ->  ${a.archive_file}`);
+    if (report.skipped.length > 0) {
+      console.log(`\nSkipped (common reasons: within cutoff, still needed as blocker):`);
+      for (const s of report.skipped) console.log(`  - ${s.id}  (${s.reason})`);
+    }
+  });
+
+busCommand
+  .command('check-deps')
+  .description('Show open dependencies blocking a task — lists blocked_by entries that are not yet completed')
+  .argument('<id>', 'Task ID')
+  .action((id: string) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const open = checkTaskDependencies(paths, id);
+    if (open.length === 0) {
+      console.log(`${id}: no open dependencies — ready to work`);
+      return;
+    }
+    console.log(`${id} blocked by ${open.length} dependency${open.length === 1 ? '' : 's'}:`);
+    for (const d of open) console.log(`  ${d.id}  [${d.status}]`);
+  });
+
+busCommand
+  .command('task-history')
+  .description("Show a task's append-only audit log (every status change, claim, and completion)")
+  .argument('<id>', 'Task ID')
+  .option('--json', 'Emit raw JSONL instead of formatted text')
+  .action((id: string, opts: { json?: boolean }) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const entries = readTaskAudit(paths, id);
+    if (entries.length === 0) {
+      console.log(`No audit log for task ${id}`);
+      return;
+    }
+    if (opts.json) {
+      for (const e of entries) console.log(JSON.stringify(e));
+      return;
+    }
+    console.log(`Audit log for ${id} (${entries.length} entries):`);
+    for (const e of entries) {
+      const transition = e.from && e.to ? `${e.from} -> ${e.to}` : e.to || '';
+      const note = e.note ? ` | ${e.note}` : '';
+      console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${transition}${note}`);
+    }
+  });
+
+busCommand
+  .command('claim-task')
+  .description('Atomically claim a pending task — marks in_progress + sets assignee in one shot, rejecting if another agent already owns it')
+  .argument('<id>', 'Task ID')
+  .option('--agent <name>', 'Agent claiming the task (defaults to CTX_AGENT_NAME)')
+  .action((id: string, opts: { agent?: string }) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const agent = opts.agent || env.agentName;
+    if (!agent) {
+      console.error('ERROR: --agent or CTX_AGENT_NAME required');
+      process.exit(1);
+    }
+    try {
+      const task = claimTask(paths, id, agent);
+      console.log(`Claimed ${id} -> in_progress (assigned to ${agent})`);
+      console.log(`  Title: ${task.title}`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
   });
 
 busCommand
@@ -142,8 +297,48 @@ busCommand
     const effectiveResult = opts.result ?? resultArg;
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+
+    // Guard: block completion when deliverables are required but missing
+    if (env.org) {
+      const err = checkDeliverableRequirement(id, env.frameworkRoot, env.org, paths.taskDir);
+      if (err) {
+        console.error(err);
+        process.exit(1);
+      }
+    }
+
     completeTask(paths, id, effectiveResult);
     console.log(`Completed ${id}`);
+  });
+
+busCommand
+  .command('save-output')
+  .description('Copy a file into the per-task deliverables tree and link it to the task as a file output')
+  .argument('<task-id>', 'Target task ID')
+  .argument('<source>', 'Source file to save (absolute or relative to cwd)')
+  .option('--label <label>', 'Human-readable label for the linked output (defaults to filename)')
+  .option('--move', 'Delete the source file after a successful copy')
+  .option('--no-link', 'Save file without linking to task.outputs[]')
+  .action((taskId: string, source: string, opts: { label?: string; move?: boolean; link?: boolean }) => {
+    const noLink = opts.link === false;
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    try {
+      const result = saveOutput(paths, {
+        taskId,
+        sourcePath: source,
+        label: opts.label,
+        move: opts.move ?? false,
+        noLink,
+      });
+      console.log(result.targetPath);
+      if (result.linked) {
+        console.log(`Linked to ${taskId} as [snapshot] ${opts.label ?? result.storedPath}`);
+      }
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
   });
 
 busCommand
@@ -151,12 +346,14 @@ busCommand
   .option('--agent <name>', 'Filter by agent')
   .option('--status <s>', 'Filter by status')
   .option('--format <fmt>', 'Output format: json or text', 'text')
-  .action((opts: { agent?: string; status?: string; format?: string }) => {
+  .option('--respect-deps', 'Sort DAG-aware: unblocked tasks first, blocked tasks last')
+  .action((opts: { agent?: string; status?: string; format?: string; respectDeps?: boolean }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const tasks = listTasks(paths, {
       agent: opts.agent,
       status: opts.status as TaskStatus,
+      respectDeps: opts.respectDeps ?? false,
     });
 
     if (opts.format === 'json') {
@@ -266,6 +463,14 @@ busCommand
       currentTask: opts.task,
       displayName,
     });
+    // Auto-emit a heartbeat event so the activity feed surfaces any live agent
+    // even if the agent itself forgets to call log-event. This makes the
+    // dashboard "agents" list derive from heartbeats, not just explicit events.
+    try {
+      logEvent(paths, env.agentName, env.org, 'heartbeat', 'heartbeat', 'info', JSON.stringify({ status, task: opts.task ?? '' }));
+    } catch {
+      // Non-fatal: heartbeat write already succeeded
+    }
     console.log(`Heartbeat updated: ${env.agentName}`);
   });
 
@@ -474,7 +679,7 @@ busCommand
   .option('--surface <path>', 'Surface file path')
   .option('--direction <dir>', 'Direction: higher or lower', 'higher')
   .option('--window <dur>', 'Measurement window', '24h')
-  .action((metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string }) => {
+  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string }) => {
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
     const id = createExperiment(agentDir, env.agentName, metric, hypothesis, {
@@ -488,13 +693,14 @@ busCommand
     const config = loadExperimentConfig(agentDir);
     if (config.approval_required) {
       const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-      const approvalId = createApproval(
+      const approvalId = await createApproval(
         paths,
         env.agentName,
         env.org,
         `Run experiment: ${metric} — ${hypothesis.slice(0, 80)}`,
         'other',
         `Experiment ID: ${id}\nMetric: ${metric}\nHypothesis: ${hypothesis}`,
+        env.frameworkRoot,
       );
       console.log(`approval_required: ${approvalId}`);
     }
@@ -718,10 +924,11 @@ busCommand
   .command('send-telegram')
   .description('Send a message to a Telegram chat')
   .argument('<chat-id>', 'Telegram chat ID')
-  .argument('<message>', 'Message text (supports Telegram Markdown)')
+  .argument('<message>', 'Message text (supports Telegram Markdown unless --plain-text is set)')
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string }) => {
+  .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
     // Resolve bot token: agent .env first, then process.env
     const env = resolveEnv();
     let botToken = '';
@@ -744,13 +951,14 @@ busCommand
     }
 
     if (!botToken) {
-      console.error('Error: BOT_TOKEN not set. Set it in your agent .env file or as an environment variable.');
+      console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
       process.exit(1);
     }
 
     const api = new TelegramAPI(botToken);
     try {
       let sentMessageId = 0;
+      let parseFallbackReason: string | null = null;
       if (opts.image) {
         const result = await api.sendPhoto(chatId, opts.image, message);
         sentMessageId = result?.result?.message_id ?? 0;
@@ -758,15 +966,31 @@ busCommand
         const result = await api.sendDocument(chatId, opts.file, message);
         sentMessageId = result?.result?.message_id ?? 0;
       } else {
-        const result = await api.sendMessage(chatId, message);
+        const result = await api.sendMessage(chatId, message, undefined, {
+          parseMode: opts.plainText ? null : 'Markdown',
+          onParseFallback: (reason) => {
+            parseFallbackReason = reason;
+          },
+        });
         sentMessageId = result?.result?.message_id ?? 0;
       }
 
       // Log outbound and cache last-sent for context injection
       const env = resolveEnv();
       if (env.agentName && env.ctxRoot) {
-        logOutboundMessage(env.ctxRoot, env.agentName, chatId, message, sentMessageId);
+        logOutboundMessage(env.ctxRoot, env.agentName, chatId, message, sentMessageId, {
+          parseMode: opts.plainText ? 'none' : 'markdown',
+          parseFallback: parseFallbackReason !== null,
+          parseFallbackReason: parseFallbackReason ?? undefined,
+        });
         cacheLastSent(env.ctxRoot, env.agentName, chatId, message);
+        // Auto-emit activity event so dashboard sees every Telegram send,
+        // even from agents that never call log-event directly.
+        try {
+          const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+          const preview = message.length > 120 ? message.slice(0, 120) + '…' : message;
+          logEvent(paths, env.agentName, env.org, 'message', 'telegram_sent', 'info', JSON.stringify({ chat_id: chatId, message_id: sentMessageId, preview }));
+        } catch { /* non-fatal */ }
       }
 
       console.log('Message sent');
@@ -782,7 +1006,7 @@ busCommand
   .argument('<title>', 'What you are requesting approval for')
   .argument('<category>', 'Category: external-comms, financial, deployment, data-deletion, other')
   .argument('[context]', 'Additional context')
-  .action((title: string, category: string, context?: string) => {
+  .action(async (title: string, category: string, context?: string) => {
     const validCategories: ApprovalCategory[] = ['external-comms', 'financial', 'deployment', 'data-deletion', 'other'];
     if (!validCategories.includes(category as ApprovalCategory)) {
       console.error(`Invalid category '${category}'. Must be one of: ${validCategories.join(', ')}`);
@@ -790,7 +1014,13 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    const id = createApproval(paths, env.agentName, env.org, title, category as ApprovalCategory, context || '');
+    // await — createApproval fan-out posts to the activity channel, which
+    // must complete before the CLI process exits or the post silently
+    // never sends. env.frameworkRoot is passed so the activity-channel
+    // orgDir resolves to where activity-channel.env actually lives (the
+    // framework repo path, NOT the runtime state path — see
+    // src/bus/approval.ts:postApprovalToActivityChannel for the history).
+    const id = await createApproval(paths, env.agentName, env.org, title, category as ApprovalCategory, context || '', env.frameworkRoot);
     console.log(id);
   });
 
@@ -883,7 +1113,7 @@ busCommand
       process.exit(1);
     }
 
-    ensureKBDirs(env.instanceId, org);
+    ensureKBDirs(env.instanceId, env.frameworkRoot, org);
 
     ingestKnowledgeBase(paths, {
       org,
@@ -1005,7 +1235,10 @@ busCommand
       }
     }
     if (!botToken) botToken = process.env.BOT_TOKEN || '';
-    if (!botToken) { console.error('Error: BOT_TOKEN not set'); process.exit(1); }
+    if (!botToken) {
+      console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
+      process.exit(1);
+    }
 
     const api = new TelegramAPI(botToken);
     let markup: object | undefined;
@@ -1041,7 +1274,10 @@ busCommand
       }
     }
     if (!botToken) botToken = process.env.BOT_TOKEN || '';
-    if (!botToken) { console.error('Error: BOT_TOKEN not set'); process.exit(1); }
+    if (!botToken) {
+      console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
+      process.exit(1);
+    }
 
     const api = new TelegramAPI(botToken);
     try {
@@ -1519,6 +1755,18 @@ busCommand
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const pruned = pruneReminders(paths, parseInt(opts.days ?? '7', 10));
     console.log(`Pruned ${pruned} acked reminder(s)`);
+  });
+
+busCommand
+  .command('update-cron-fire')
+  .argument('<cron-name>', 'Name of the cron as defined in config.json')
+  .option('--interval <interval>', 'Expected interval, e.g. "6h", "24h", "30m"')
+  .description('Record that a named cron just fired (enables daemon gap detection for dead zones)')
+  .action((cronName: string, opts: { interval?: string }) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    updateCronFire(paths.stateDir, cronName, opts.interval);
+    console.log(`Recorded fire for cron "${cronName}"`);
   });
 
 busCommand
