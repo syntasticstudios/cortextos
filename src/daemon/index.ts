@@ -1,5 +1,6 @@
 import { AgentManager } from './agent-manager.js';
 import { IPCServer } from './ipc-server.js';
+import { StaleAgentWatchdog } from './stale-watchdog.js';
 import { writeFileSync, existsSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -12,6 +13,7 @@ import { ensureDir } from '../utils/atomic.js';
 class Daemon {
   private agentManager: AgentManager | null = null;
   private ipcServer: IPCServer | null = null;
+  private watchdog: StaleAgentWatchdog | null = null;
   private instanceId: string;
   private ctxRoot: string;
 
@@ -58,6 +60,10 @@ class Daemon {
     // Discover and start agents
     await this.agentManager.discoverAndStart();
 
+    // Start stale-agent watchdog: checks every 5m, restarts agents with heartbeats >15m old
+    this.watchdog = new StaleAgentWatchdog(this.agentManager, this.ctxRoot, frameworkRoot);
+    this.watchdog.start();
+
     console.log(`[daemon] Running (pid: ${process.pid})`);
 
     // Handle shutdown signals
@@ -69,6 +75,9 @@ class Daemon {
         }
       } catch (err) {
         console.error('[daemon] Error during shutdown:', err);
+      }
+      if (this.watchdog) {
+        this.watchdog.stop();
       }
       if (this.ipcServer) {
         this.ipcServer.stop();
