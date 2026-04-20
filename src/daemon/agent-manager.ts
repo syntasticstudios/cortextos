@@ -238,6 +238,9 @@ export class AgentManager {
     }
 
     const agentProcess = new AgentProcess(name, env, config, log);
+    if (this.quietCheckFn) {
+      agentProcess.setQuietCheck(this.quietCheckFn);
+    }
     const checker = new FastChecker(agentProcess, paths, this.frameworkRoot, {
       log,
       telegramApi,
@@ -634,6 +637,19 @@ export class AgentManager {
       } catch (err) {
         console.error(`[agent-manager] Error stopping ${name}:`, err);
       }
+    }
+  }
+
+  /**
+   * Set quiet-hours check on all current and future agents.
+   * Called by daemon after SleepScheduler is created.
+   */
+  private quietCheckFn: ((name: string) => boolean) | null = null;
+
+  setQuietCheck(fn: (name: string) => boolean): void {
+    this.quietCheckFn = fn;
+    for (const [, entry] of this.agents) {
+      entry.process.setQuietCheck(fn);
     }
   }
 

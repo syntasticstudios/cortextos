@@ -53,6 +53,7 @@ export class AgentProcess {
   private dedup: MessageDedup;
   private log: LogFn;
   private onStatusChange: ((status: AgentStatus) => void) | null = null;
+  private isQuietFn: ((name: string) => boolean) | null = null;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -294,6 +295,14 @@ export class AgentProcess {
    */
   onStatusChanged(handler: (status: AgentStatus) => void): void {
     this.onStatusChange = handler;
+  }
+
+  /**
+   * Set the quiet-hours check function (from SleepScheduler).
+   * When set, gap-detection nudges are suppressed if this returns true.
+   */
+  setQuietCheck(fn: (name: string) => boolean): void {
+    this.isQuietFn = fn;
   }
 
   /**
@@ -737,6 +746,12 @@ export class AgentProcess {
         const threshold = intervalMs * GAP_MULTIPLIER;
 
         if (gapMs > threshold) {
+          // Sleep scheduler: suppress nudges during quiet hours (agent stays alive,
+          // just no new cron prods — saves tokens overnight without losing context)
+          if (this.isQuietFn && this.isQuietFn(this.name)) {
+            continue;
+          }
+
           const gapMin = Math.round(gapMs / 60_000);
           const expectedMin = Math.round(intervalMs / 60_000);
           const nudge = `[SYSTEM] Cron gap detected for "${cronDef.name}": last fired ${gapMin} minutes ago (expected every ${expectedMin} minutes). Run CronList to verify the cron is still active. If missing, restore it from config.json: /loop ${cronDef.interval} <cron prompt>.`;
