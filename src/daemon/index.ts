@@ -1,6 +1,7 @@
 import { AgentManager } from './agent-manager.js';
 import { IPCServer } from './ipc-server.js';
 import { StaleAgentWatchdog } from './stale-watchdog.js';
+import { SleepScheduler } from './sleep-scheduler.js';
 import { writeFileSync, existsSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -14,6 +15,7 @@ class Daemon {
   private agentManager: AgentManager | null = null;
   private ipcServer: IPCServer | null = null;
   private watchdog: StaleAgentWatchdog | null = null;
+  private sleepScheduler: SleepScheduler | null = null;
   private instanceId: string;
   private ctxRoot: string;
 
@@ -64,6 +66,10 @@ class Daemon {
     this.watchdog = new StaleAgentWatchdog(this.agentManager, this.ctxRoot, frameworkRoot);
     this.watchdog.start();
 
+    // Start sleep scheduler: stops agents outside their active hours, wakes on inbox message
+    this.sleepScheduler = new SleepScheduler(this.agentManager, this.ctxRoot, frameworkRoot);
+    this.sleepScheduler.start();
+
     console.log(`[daemon] Running (pid: ${process.pid})`);
 
     // Handle shutdown signals
@@ -78,6 +84,9 @@ class Daemon {
       }
       if (this.watchdog) {
         this.watchdog.stop();
+      }
+      if (this.sleepScheduler) {
+        this.sleepScheduler.stop();
       }
       if (this.ipcServer) {
         this.ipcServer.stop();
