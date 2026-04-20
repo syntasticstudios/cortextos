@@ -1,10 +1,10 @@
 import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync } from 'fs';
-import { execFile } from 'child_process';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
 import { updateApproval } from '../bus/approval.js';
+import { updateHeartbeat } from '../bus/heartbeat.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { KEYS } from '../pty/inject.js';
@@ -90,14 +90,17 @@ export class FastChecker {
     await this.waitForBootstrap();
     this.log('Bootstrap complete. Beginning poll loop.');
 
-    // Idle-session heartbeat watchdog: fires every 50 min regardless of REPL state
-    const HEARTBEAT_INTERVAL_MS = 50 * 60 * 1000;
+    // Daemon-side heartbeat: writes directly to state/{agent}/heartbeat.json
+    // every 10 min so the stale-agent watchdog (15m threshold) sees the agent as alive.
+    // This replaces the old 50-min execFile approach that required agent env vars.
+    const HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
     const agentName = this.agent.name;
+
+    // Write initial heartbeat immediately at bootstrap
+    this.writeHeartbeat(agentName, 'online');
+
     this.heartbeatTimer = setInterval(() => {
-      const ts = new Date().toISOString();
-      execFile('cortextos', ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`], (err) => {
-        if (err) this.log(`Heartbeat watchdog error: ${err.message}`);
-      });
+      this.writeHeartbeat(agentName, 'online');
     }, HEARTBEAT_INTERVAL_MS);
 
     while (this.running) {
@@ -124,6 +127,20 @@ export class FastChecker {
     if (this.heartbeatTimer !== null) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
+    }
+  }
+
+  /**
+   * Write heartbeat directly (no shell-out, no env vars needed).
+   */
+  private writeHeartbeat(agentName: string, status: string): void {
+    try {
+      // Build a minimal paths object pointing to the agent's state dir
+      const stateDir = join(this.paths.ctxRoot, 'state', agentName);
+      const heartbeatPaths = { ...this.paths, stateDir };
+      updateHeartbeat(heartbeatPaths, agentName, status);
+    } catch (err) {
+      this.log(`Heartbeat write error: ${(err as Error).message}`);
     }
   }
 
