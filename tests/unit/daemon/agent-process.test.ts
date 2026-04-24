@@ -271,6 +271,26 @@ describe('AgentProcess - cron auto-verification', () => {
     expect(mockInjectMessage).not.toHaveBeenCalled();
   });
 
+  it('scheduleCronVerification() is a no-op when config has only disabled crons', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {
+      crons: [{ name: 'paused-job', type: 'disabled' as const, interval: '1h', prompt: 'test' }],
+    });
+    await ap.start();
+    ap.scheduleCronVerification();
+    await new Promise(r => setTimeout(r, 100));
+    expect(mockInjectMessage).not.toHaveBeenCalled();
+  });
+
+  it('scheduleGapDetection() is a no-op when config has only disabled crons', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {
+      crons: [{ name: 'paused-job', type: 'disabled' as const, interval: '1h', prompt: 'test' }],
+    });
+    await ap.start();
+    ap.scheduleGapDetection();
+    await new Promise(r => setTimeout(r, 100));
+    expect(mockInjectMessage).not.toHaveBeenCalled();
+  });
+
   it('scheduleCronVerification() schedules verification when config has recurring crons', async () => {
     const ap = new AgentProcess('alice', mockEnv, {
       crons: [

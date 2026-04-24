@@ -1,4 +1,4 @@
-import { appendFileSync } from 'fs';
+import { appendFileSync, renameSync, statSync } from 'fs';
 import { redactSecrets } from './redact.js';
 
 // Dynamic import for strip-ansi (ESM module)
@@ -11,6 +11,8 @@ async function loadStripAnsi() {
   return stripAnsi;
 }
 
+const MAX_LOG_BYTES = 50 * 1024 * 1024; // 50 MB — rotate before OS file-cache pressure builds
+
 /**
  * Ring buffer for PTY output. Replaces tmux capture-pane.
  * Stores raw output chunks and provides search/retrieval with ANSI stripping.
@@ -19,10 +21,12 @@ export class OutputBuffer {
   private chunks: string[] = [];
   private maxChunks: number;
   private logPath: string | null;
+  private bootstrapPattern: string;
 
-  constructor(maxChunks: number = 1000, logPath?: string) {
+  constructor(maxChunks: number = 1000, logPath?: string, bootstrapPattern?: string) {
     this.maxChunks = maxChunks;
     this.logPath = logPath || null;
+    this.bootstrapPattern = bootstrapPattern || 'permissions';
   }
 
   /**
@@ -47,6 +51,12 @@ export class OutputBuffer {
     // Stream to log file (replaces tmux pipe-pane)
     if (this.logPath) {
       try {
+        try {
+          const size = statSync(this.logPath).size;
+          if (size >= MAX_LOG_BYTES) {
+            try { renameSync(this.logPath, this.logPath + '.1'); } catch { /* ignore */ }
+          }
+        } catch { /* file doesn't exist yet — skip rotation check */ }
         appendFileSync(this.logPath, safe, 'utf-8');
       } catch {
         // Ignore log write errors
@@ -82,19 +92,25 @@ export class OutputBuffer {
   }
 
   /**
-   * Check if agent has bootstrapped (permissions prompt appeared).
+   * Check if agent has bootstrapped (ready-for-input signal appeared).
+   *
+   * For Claude Code: looks for the "permissions" status-bar text.
+   * For Hermes: looks for the "❯" prompt character (configurable via constructor).
+   * The bootstrap pattern is set at construction time by the PTY class.
    */
   isBootstrapped(): boolean {
-    // Look for Claude Code's status bar which shows "permissions" as a mode indicator.
-    // Avoid false positives from the trust folder prompt which also contains permission-related text.
-    // The status bar appears after Claude has fully initialized and is ready for input.
     const recent = this.getRecent();
     const cleaned = recent.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
-    // Trust prompt contains "trust this folder" - exclude that
-    if (cleaned.includes('trust') && !cleaned.includes('> ')) {
-      return false;
+
+    if (this.bootstrapPattern === 'permissions') {
+      // Claude Code: exclude trust-folder prompt false positives.
+      // The trust prompt shows "trust this folder" before the status bar appears.
+      if (cleaned.includes('trust') && !cleaned.includes('> ')) {
+        return false;
+      }
     }
-    return cleaned.includes('permissions');
+
+    return cleaned.includes(this.bootstrapPattern);
   }
 
   /**
