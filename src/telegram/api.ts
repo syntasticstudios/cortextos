@@ -18,12 +18,28 @@ export class TelegramAPI {
   }
 
   /**
-   * Strip MarkdownV2-style backslash escapes that Telegram Markdown v1 doesn't support.
-   * In v1, only *, _, `, [ are special. Everything else should not be backslash-escaped.
+   * Prepare text for Telegram Markdown v1 sending.
+   *
+   * Two passes:
+   * 1. Strip backslash escapes before chars that are NOT Markdown v1 special
+   *    (MarkdownV2-style escaping like \! \. \- breaks v1 rendering).
+   * 2. Escape word-internal underscores that Telegram would interpret as italic
+   *    markers. Agent-generated text routinely contains task IDs, function names,
+   *    and file paths with underscores (e.g. task_1776983560882_014, snake_case)
+   *    that trigger "can't parse entities" errors. Backslash-escaping them keeps
+   *    the Markdown parse_mode working without stripping all formatting.
+   *
+   * Intentional *bold*, `code`, and [text](url) formatting is preserved because
+   * those patterns are balanced and don't require escaping.
    */
   private sanitizeMarkdown(text: string): string {
-    // Remove backslash before any char that isn't a Markdown v1 special char or newline
-    return text.replace(/\\([^_*`\[\n])/g, '$1');
+    return text
+      // Pass 1: remove backslash before non-special chars
+      .replace(/\\([^_*`\[\n])/g, '$1')
+      // Pass 2: escape underscores flanked by word chars on both sides.
+      // \w_\w matches snake_case, task_ids, and function_names but not
+      // list bullets "- item", leading/trailing, or intentional _italic_ pairs.
+      .replace(/(\w)_(\w)/g, '$1\\_$2');
   }
 
   /**
