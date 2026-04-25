@@ -6,6 +6,7 @@ import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
 import { updateApproval } from '../bus/approval.js';
+import { updateHeartbeat } from '../bus/heartbeat.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { KEYS } from '../pty/inject.js';
@@ -106,14 +107,17 @@ export class FastChecker {
     await this.waitForBootstrap();
     this.log('Bootstrap complete. Beginning poll loop.');
 
-    // Idle-session heartbeat watchdog: fires every 50 min regardless of REPL state
-    const HEARTBEAT_INTERVAL_MS = 50 * 60 * 1000;
+    // Idle-session heartbeat watchdog: write directly every 10 min so the
+    // dashboard never sees a stale heartbeat during long idle sessions.
+    const HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000;
     const agentName = this.agent.name;
+    updateHeartbeat(this.paths, agentName, 'online');
     this.heartbeatTimer = setInterval(() => {
-      const ts = new Date().toISOString();
-      execFile('cortextos', ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`], (err) => {
-        if (err) this.log(`Heartbeat watchdog error: ${err.message}`);
-      });
+      try {
+        updateHeartbeat(this.paths, agentName, 'online');
+      } catch (err) {
+        this.log(`Heartbeat watchdog error: ${err}`);
+      }
     }, HEARTBEAT_INTERVAL_MS);
 
     while (this.running) {
