@@ -61,8 +61,17 @@ PR #279 by backend-architect. listAllOrders/listOrdersByPatient/listOrdersByPhar
 ## HiGreen recovery (2026-04-29)
 HiGreen was down ~5 days (last sync ~2026-04-24). Recovered 2026-04-29 — 5,704 offers synced. Circuit breaker auto-reset after probe succeeded. HUMAN verify task (task_1777104868827_831) closed. Monitor next 07:00/19:00 UTC cron cycles to confirm sustained recovery.
 
-## Architecture drift baseline (2026-04-28)
-phytomedic-saas Convex codebase: LOW drift risk. Greptile enforcement is effective. Main live patterns: collect() always index-scoped, N+1s being addressed, security hardening active. Known open issues: questionnaireData: v.any() in cases.ts (LOW), 3 analyticsSnapshot v.any() fields (LOW). Review next check in ~2 weeks.
+## Architecture drift baseline (updated 2026-05-05)
+phytomedic-saas Convex codebase: LOW drift risk. Greptile enforcement is effective. Known open issues: 3 analyticsSnapshot v.any() fields (usersByRole, fieldCompleteness, providerBreakdown — LOW). questionnaireData is properly typed v.object() in schema — prior flag was wrong. Review next check ~2026-05-19.
+FLAG-cannametrics: _ingestProviderPriceSnapshots (non-paginated internalMutation) is dead code — daily cron was updated to use paginated _ingestProviderPriceSnapshotsAction but old function not removed. With 11,448+ HiGreen offers, manual invocation would fail (8192-doc mutation limit). Stale comment at line 1503 cannametrics.ts says "daily cron uses this directly" — misleading. Route to backend-architect for cleanup.
+FLAG-cannametrics: PRICE_SNAPSHOT_PROVIDERS includes cannaflow/wawican/greeners/gruenhorn with no sync crons and zero offers — daily cron runs 4 no-op iterations. Low overhead, cosmetic.
+
+## BUG-PROD-09/10 — RESOLVED (2026-05-05, PR #398)
+BUG-PROD-09: Pharmacy URL numeric-suffix removal — cleanPharmacySlugs migration ran 2026-05-05 ~17:07 UTC: 323 updated, 1 skipped (already normalized), 324 total. All URLs now {name}-{city} format. Old numeric-suffix URLs auto-redirect via permanentRedirect in getPublicPharmacyBySlug. FULLY RESOLVED.
+BUG-PROD-10: Apotheken-Detail Top-Sorten section — getTopProductsByPharmacy query deployed. Sorts available offers by THC% desc, returns top 6. Empty state renders correctly when pharmacy has no mapped offers. Follow-up fix fa029fd: considers all available products before sorting (not just first 18). Verified via code review.
+
+## PR #400 COHERENCE-2-01/02 — MERGED (2026-05-05, 16:59 UTC)
+Cultivar plain text fallback (product-hero.tsx: span when no strainSlug) + strain→catalog CTA (strains/[slug]/page.tsx: genetics-filtered CTA section with h2 heading). Greptile 4/5 — a11y finding (p→h2) fixed in commit 3f0347fc before merge.
 
 ## insertRoutingEvent — VERIFIED COMPLETE (2026-04-28)
 Wired in 8 call sites: checkout.ts, submitPrescriptionToCannaleo.ts (×4), processWebhook.ts, cases.ts, orders.ts. Goal #2 from goals.json confirmed done.
@@ -89,6 +98,22 @@ All 5 doctor cards on /medizin/arzt-finden show "Dr. med. Dr. med. [Name]" — s
 
 ## PR #272 fix/legal-pages — Greptile P1, blocked (2026-04-29)
 Legal texts still reference cannabis-aerzte.de (not PhytoMedic). Missing GDPR sections §9, §14-22, §24, §26, §28-30. Score 2/5. ESLint error auto-fixed (commit 1e444ce). Cannot merge until legal content is reviewed and rebranded. User alerted.
+
+## HiGreen pricing — FULLY RESOLVED (2026-05-05, PR #377, commit 8fff1ae)
+Root cause: HiGreenPrice.pharmacy typed as `string` but API sends `{id: string, name: string}` object → transformer produced `hg_[object Object]` pharmacy IDs → prices[] silently skipped since launch. Fix: types.ts HiGreenPharmacyRef union type, transformer resolvePharmacyRef()/resolvePharmacyName() helpers at all 5 sites, cleanupHiGreenObjectOffers migration (7 iterations, 1384 ghost offers deleted). Final state: 5724 offers / 4 real pharmacies / priceCentsGross populated. Snapshot coverage: Cannaleo 7/7, HiGreen 1/7 (May 5 baseline — Apr 29-May 4 unrecoverable, offers didn't exist). Daily cron captures HiGreen from May 6 onwards. Also: PR #374 fixed daily snapshot cron (Convex 32k read limit).
+
+## HiGreen offer pipeline — FIXED (2026-05-05)
+PR #373: price.pharmacy_id field mismatch (API sends price.pharmacy). Zero offers had been ingested since launch. After fix + cleanup: 1,384 products / 11,448 availability offers / 0 errors. Offer pipeline healthy. Separate issue: prices[] also present but skipped due to nested pharmacy object bug (see above).
+
+## Price snapshot backfill — Cannaleo recovered (2026-05-05)
+PR #374 fixed daily snapshot cron (Convex 32k read limit). Backfill run: Cannaleo 7/7 dates (Apr 29-May 5) recovered. HiGreen 0/7 pending code fix in transformer.ts (see HiGreen pricing bug above).
+
+## terpeneData Array guard fix — RESOLVED (2026-05-05)
+getPublicProductsForFilter (introduced in PR #397 squash, commit 013153d) lacked Array.isArray guard on terpeneData. Products with legacy non-array terpeneData crashed the entire query. Fix: f6a48e9 by backend-architect — Array.isArray(p.terpeneData) ? p.terpeneData : []. Lesson: any Convex query mapping over nested arrays needs Array.isArray guard for legacy data safety. Verified 16:23 UTC.
+
+## BUG-CATALOG-01 — FULLY RESOLVED (2026-05-05, post-correction)
+Root cause: fp:/fp: identity collision (two DB docs per productIdentity hash — one with manufacturerKey set, one null). Fix: PR #388 diagnosis + PR #391 OCC-resilient migration. Migration ran 2026-05-05 ~12:00 UTC: 1358 groups processed, 2323 deactivated, 223 offers redirected, 7887 offers dropped, skipped=0.
+SECONDARY ISSUE: migration over-deactivated 2 products (Bediol, Bedrocan 25/1) — both fp: twins had manufacturerKey=null, no keeper selected, both deactivated. backend-architect ran reactivateBedrocanProducts: 3 reactivated (Elida=Bediol, Afina=Bedrocan 25/1, Rensina), 9 true orphans skipped (no offers). Bedrocan filter now shows 6 products: Bedica 14/1, Bediol, Bedrocan 22/1, Bedrocan 25/1, Bedrobinol 14/1, Bedrocan Forte 25/1. Verified by platform-director 2026-05-05 ~12:30 UTC. BUG-CATALOG-01 fully closed.
 
 ## HUNT-20260428-01 strain-product linkage — FULLY RESOLVED (2026-04-29)
 PR #281 by backend-architect. upsertProduct now slug-matches cultivar against strains on every sync. backfillStrainLinkage ran 2026-04-29 — 292 products linked. "Produkte mit dieser Sorte" on strain detail pages now shows correct results.
