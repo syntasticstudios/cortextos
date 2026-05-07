@@ -61,10 +61,11 @@ PR #279 by backend-architect. listAllOrders/listOrdersByPatient/listOrdersByPhar
 ## HiGreen recovery (2026-04-29)
 HiGreen was down ~5 days (last sync ~2026-04-24). Recovered 2026-04-29 — 5,704 offers synced. Circuit breaker auto-reset after probe succeeded. HUMAN verify task (task_1777104868827_831) closed. Monitor next 07:00/19:00 UTC cron cycles to confirm sustained recovery.
 
-## Architecture drift baseline (updated 2026-05-05)
-phytomedic-saas Convex codebase: LOW drift risk. Greptile enforcement is effective. Known open issues: 3 analyticsSnapshot v.any() fields (usersByRole, fieldCompleteness, providerBreakdown — LOW). questionnaireData is properly typed v.object() in schema — prior flag was wrong. Review next check ~2026-05-19.
-FLAG-cannametrics: _ingestProviderPriceSnapshots (non-paginated internalMutation) is dead code — daily cron was updated to use paginated _ingestProviderPriceSnapshotsAction but old function not removed. With 11,448+ HiGreen offers, manual invocation would fail (8192-doc mutation limit). Stale comment at line 1503 cannametrics.ts says "daily cron uses this directly" — misleading. Route to backend-architect for cleanup.
-FLAG-cannametrics: PRICE_SNAPSHOT_PROVIDERS includes cannaflow/wawican/greeners/gruenhorn with no sync crons and zero offers — daily cron runs 4 no-op iterations. Low overhead, cosmetic.
+## Architecture drift baseline (updated 2026-05-06)
+phytomedic-saas Convex codebase: LOW drift risk. Greptile enforcement is effective. Known open issues: 3 analyticsSnapshot v.any() fields (usersByRole, fieldCompleteness, providerBreakdown — LOW). questionnaireData is properly typed v.object() in schema — prior flag was wrong. Review next check ~2026-05-20.
+RESOLVED: _ingestProviderPriceSnapshots dead code — function no longer exists in cannametrics.ts (confirmed 2026-05-06). Prior flag closed.
+FLAG-cannametrics (cosmetic): PRICE_SNAPSHOT_PROVIDERS still includes cannaflow/wawican/greeners/gruenhorn with no sync crons and zero offers — 4 no-op cron iterations daily. Low overhead, no action needed unless cron cost becomes a concern.
+Recent PR safety check (PRs #436, #437, #438, #439): No new v.any() fields, no new unbounded .collect() in hot-path code. clearZeroPriceOffers (PR #439) uses paginate correctly. All .collect() in migrations.ts are pre-existing small-table migrations (doctorProfiles, articles).
 
 ## BUG-PROD-09/10 — RESOLVED (2026-05-05, PR #398)
 BUG-PROD-09: Pharmacy URL numeric-suffix removal — cleanPharmacySlugs migration ran 2026-05-05 ~17:07 UTC: 323 updated, 1 skipped (already normalized), 324 total. All URLs now {name}-{city} format. Old numeric-suffix URLs auto-redirect via permanentRedirect in getPublicPharmacyBySlug. FULLY RESOLVED.
@@ -87,8 +88,8 @@ backend-architect added .take() limits to 13 user-facing Convex queries. Previou
 - fix/price-snapshot-pagination: backfillPriceSnapshots redesign — paginates _ingestProviderPriceSnapshots to fix 32k read limit. Active (cannametrics-data).
 - feat/design-polish-p1-p2: P1+P2 monochromatic design polish pass. Active.
 
-## /onboarding/arzt + /onboarding/apotheke — auth bypass (2026-04-29)
-Both routes render profile creation forms (doctor: Praxis-Name/Fachrichtung/Kassenart; pharmacy: Apotheken-Name/Stadt/PLZ) without auth redirect. /onboarding root is intentionally public; sub-routes were not protected by middleware. PR #313 by frontend-dev — middleware fix in progress.
+## /onboarding/arzt + /onboarding/apotheke — auth bypass RESOLVED (2026-04-29, verified fixed 2026-05-06)
+Both routes now redirect to accounts.phytomedic.de/sign-in (Clerk auth). PR #313 middleware fix confirmed live 2026-05-06.
 
 ## backfillPriceSnapshots — redesign in progress (updated 2026-04-29)
 Original run times out. cannametrics-data redesigning for smaller batches. Apr 15-28 price snapshot gap persists until redesign complete + run. Task: task_1777450660264_986 (pending, blocked on redesign).
@@ -117,3 +118,50 @@ SECONDARY ISSUE: migration over-deactivated 2 products (Bediol, Bedrocan 25/1) �
 
 ## HUNT-20260428-01 strain-product linkage — FULLY RESOLVED (2026-04-29)
 PR #281 by backend-architect. upsertProduct now slug-matches cultivar against strains on every sync. backfillStrainLinkage ran 2026-04-29 — 292 products linked. "Produkte mit dieser Sorte" on strain detail pages now shows correct results.
+
+## Doctor finder doubled Dr. med. prefix — RESOLVED (2026-05-05)
+task_1777447971774_670 closed. PR #392 commit 6f9b6fa in main — MEDICAL_TITLE_RE guard in formatDoctorName prevents prefix duplication. Verified clean on prod 2026-05-06: 5 doctors, 0 doubled prefixes.
+
+## Wissen markdown rendering — RESOLVED (2026-05-06, PR #414 merged)
+Raw markdown chars (#, ##, **, -) in /wissen/ article body were rendering as literal text. Fix: renderContent loop with renderInline helper for ATX headings, bold/italic, lists. Safety: safeExternalUrl/safeInternalPath utilities reused for href validation (data: and javascript: blocked). HUNT-20260506-01 closed.
+
+## Checkout step labels — RESOLVED (2026-05-06, PR #415 merged)
+Long German step labels (e.g. "Ausweisprüfung") clipped by `truncate` class — replaced with `break-words` within 56px column. 5/5 Greptile.
+
+## Lineage grandparents — RESOLVED (2026-05-06, PR #410 merged)
+SVG lineage graph extended with grandparent row (dashed edges, 75% opacity). Data fetched via skippable useQuery on deduplicated parentStrainIds. Backwards-compatible. 4/5 Greptile.
+
+## Schlafstörungen seed dedup — RESOLVED (2026-05-06, PR #412 merged)
+Seed slug normalized from "schlafstörungen" to "schlafstorungen" matching post-migration DB record. Prevents idempotency check miss and re-insertion on cold deploys. 4/5 Greptile.
+
+## BUG-COHERENCE-01 — filed (2026-05-06)
+Some products on /medizin/strains/amnesia-haze link using raw Convex document IDs (ph78d...) instead of clean slugs. Same products appear with fp: slugs in catalog. Root cause (cannametrics-data 2026-05-06): Convex _id stored as slug (32-char alphanumeric like ph78d...). catalog.ts:1795 upsert guard (`existing.slug ? {} : { slug }`) skips any truthy slug — corrupt slugs never overwritten by backfill. Fix: migration to find slug matching /^[a-z0-9]{32}$/ and regenerate via productSlug(). task_1778049814096_104 → backend-architect.
+
+## PR merge wave complete — 2026-05-06 08:43 UTC
+All PRs merged this session (#409-#427, 16 total). Key outcomes:
+- P0-04 security fix (protocol-relative URL bypass): LIVE in production via PR #421
+- BUG-COHERENCE-01 corrupt slug migration: MERGED (PR #417). Run backfillCorruptProductSlugs via Convex dashboard.
+- Schlafstörungen DB dedup: MERGED (PR #427, includes product slug patching + Set dedup). Run deduplicateSchlafstorungen via Convex dashboard.
+- Pharmacy detail info hierarchy (BUG-PROD-14): MERGED PR #411 + PR #426
+- stripeReconciler auth fix (P0-03): MERGED PR #422
+- W21 quality cycle complete: P0-04 graduated, lint-rules cleaned up (PR #424)
+
+## PR #436 — MERGED (2026-05-06 ~12:36 UTC)
+fix(checkout): honor offerId URL param + fix offer-selection logic. Three-tier priority: exact offerId → pharmacyId → cheapest. Stale-closure dep fix for useMemo. Greptile 4/5. NOTE: Convex embedded offer objects may not carry `_id` — the offerId exact-match branch may silently no-op; fallback chain still correct. Route to backend-architect for follow-up verification.
+
+## PR #439 — MERGED (2026-05-06 ~12:34 UTC)
+fix(sync): treat Cannaleo price_gross=0 as no-price; clear existing zeros (COHERENCE-10-01). normalizePrice now returns undefined for num<=0. clearZeroPriceOffers paginated migration added. Greptile 5/5. PENDING: run clearZeroPriceOffers via Convex dashboard.
+
+## PENDING CONVEX DASHBOARD ACTIONS (2026-05-06)
+1. ~~internal.functions.migrations.deduplicateSchlafstorungen~~ — DONE 2026-05-06 ~09:50 UTC (deleted=1, verified prod clean)
+2. internal.functions.catalog.backfillCorruptProductSlugs — fixes Convex ID and fp: slugs in products table (from PR #417)
+3. internal.functions.migrations.clearZeroPriceOffers — backfills existing price_gross=0 offers to undefined (from PR #439)
+
+## React #418 pattern on apotheke-finden — RESOLVED (2026-05-07, PRs #474–#478)
+5 fix PRs merged across 6 iterations. VERIFIED FIXED 2026-05-07T06:01 UTC (dpl_6HenuX7tHt7x6Z1FvLZ2ofW4WbLs).
+Fixes: (1) Radix Tabs useId() #474, (2) Radix Select useId() #475, (3) usePreloadedQuery dual subscription #476, (4) suppressHydrationWarning header #477, (5) useQuery "skip" guard when !hasMounted #478
+Root cause: Convex worker delivers cached subscription data via MessagePort before React hydration completes → useState initializer sees different value SSR vs client → #418.
+LESSON: The shared Convex chunk (4fa395d360c87cc3.js) never changed hash — bug appeared to be in shared code but was actually a timing race. Previous test failures were from persistent Playwright session Convex worker cache delivering fast. Fresh session = no race. Guard ALL useQuery calls with "skip" when !hasMounted on pages using Clerk+Convex providers.
+
+## Coherence audit Cluster 2 (Pharmacy ↔ Products) — VERIFIED CLEAN (2026-05-06)
+Pharmacy → Products: "Alle ansehen →" + "Produkte ansehen" both filter by ?apotheke= slug. Products → Pharmacy: all 5 pharmacy links on product detail pages work. No NaN/undefined. Trust badge absent (correct — no isVerified field in schema, gated by PR #411).
