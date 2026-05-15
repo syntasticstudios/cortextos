@@ -1,5 +1,11 @@
 # Long-Term Memory
 
+## Phase 1 Batch 5+6 complete (2026-05-08)
+PRs #541-#550 all merged 2026-05-07. ADMIN-SHADOW-03/04, B2B-01-05, UPLOAD-03, COST-01, MOBILE-02, BUG-P0-05 (compliance snapshot), GoBD invoice sequence fix, quality graduation P0-05/P1-13. Phase tracker update needed by platform-director.
+
+## Known heartbeat registry artifact (2026-05-08)
+"objective-mclaren" appears as a STALE entry in the heartbeat registry — it is a leftover watchdog from an old session, not a real agent. Do NOT alert on it. Confirmed by platform-director.
+
 ## Onboarding Context — 2026-04-12
 
 ### What "healthy" means for PhytoMedic
@@ -165,3 +171,8 @@ LESSON: The shared Convex chunk (4fa395d360c87cc3.js) never changed hash — bug
 
 ## Coherence audit Cluster 2 (Pharmacy ↔ Products) — VERIFIED CLEAN (2026-05-06)
 Pharmacy → Products: "Alle ansehen →" + "Produkte ansehen" both filter by ?apotheke= slug. Products → Pharmacy: all 5 pharmacy links on product detail pages work. No NaN/undefined. Trust badge absent (correct — no isVerified field in schema, gated by PR #411).
+
+## Sweep testing methodology (added 2026-05-12)
+1. Fill React inputs via Playwright fill() only — never JS element.value + dispatchEvent (bypasses React state)
+2. Check for checkboxes via `input[type="checkbox"], [role="checkbox"]` — Clerk/Radix use ARIA pattern not native inputs
+3. Result: 2 Batch 1 false positives caught and closed by frontend-dev
