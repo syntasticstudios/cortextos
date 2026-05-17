@@ -958,7 +958,6 @@ busCommand
     const api = new TelegramAPI(botToken);
     try {
       let sentMessageId = 0;
-      let parseFallbackReason: string | null = null;
       if (opts.image) {
         const result = await api.sendPhoto(chatId, opts.image, message);
         sentMessageId = result?.result?.message_id ?? 0;
@@ -967,10 +966,7 @@ busCommand
         sentMessageId = result?.result?.message_id ?? 0;
       } else {
         const result = await api.sendMessage(chatId, message, undefined, {
-          parseMode: opts.plainText ? null : 'Markdown',
-          onParseFallback: (reason) => {
-            parseFallbackReason = reason;
-          },
+          parseMode: opts.plainText ? null : 'HTML',
         });
         sentMessageId = result?.result?.message_id ?? 0;
       }
@@ -979,9 +975,7 @@ busCommand
       const env = resolveEnv();
       if (env.agentName && env.ctxRoot) {
         logOutboundMessage(env.ctxRoot, env.agentName, chatId, message, sentMessageId, {
-          parseMode: opts.plainText ? 'none' : 'markdown',
-          parseFallback: parseFallbackReason !== null,
-          parseFallbackReason: parseFallbackReason ?? undefined,
+          parseMode: opts.plainText ? 'none' : 'html',
         });
         cacheLastSent(env.ctxRoot, env.agentName, chatId, message);
         // Auto-emit activity event so dashboard sees every Telegram send,

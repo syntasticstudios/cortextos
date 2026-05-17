@@ -1,4 +1,4 @@
-import { appendFileSync } from 'fs';
+import { appendFileSync, renameSync, statSync } from 'fs';
 import { redactSecrets } from './redact.js';
 
 // Dynamic import for strip-ansi (ESM module)
@@ -10,6 +10,8 @@ async function loadStripAnsi() {
   }
   return stripAnsi;
 }
+
+const MAX_LOG_BYTES = 50 * 1024 * 1024; // 50 MB — rotate before OS file-cache pressure builds
 
 /**
  * Ring buffer for PTY output. Replaces tmux capture-pane.
@@ -47,6 +49,12 @@ export class OutputBuffer {
     // Stream to log file (replaces tmux pipe-pane)
     if (this.logPath) {
       try {
+        try {
+          const size = statSync(this.logPath).size;
+          if (size >= MAX_LOG_BYTES) {
+            try { renameSync(this.logPath, this.logPath + '.1'); } catch { /* ignore */ }
+          }
+        } catch { /* file doesn't exist yet — skip rotation check */ }
         appendFileSync(this.logPath, safe, 'utf-8');
       } catch {
         // Ignore log write errors
