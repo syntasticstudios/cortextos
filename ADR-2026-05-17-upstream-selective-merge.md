@@ -26,13 +26,23 @@ Cherry-pick **reliability-only commits** onto a separate branch (`upstream/relia
 3. Conflict → abort that pick; document why (almost always: depends on a skipped feature).
 4. Local patches win on ambiguity. Upstream wins only if unambiguous bugfix.
 
+### Tally
+
+| Class | Examined | Taken | Skipped |
+|---|---|---|---|
+| Reliability candidates | 14 | 12 | 2 (feature-dependency conflicts) |
+| Docs-only candidates | 2 | 0 | 2 (reference skipped templates) |
+| **Total examined** | **16** | **12** | **4** |
+
+The ~90 remaining upstream commits are pure feature scope, not candidates for this exercise — listed below under "Deliberately skipped — feature scope."
+
 ### Cherry-picked (12)
 
 | New SHA | Upstream SHA | Title |
 |---|---|---|
 | 3f26aa7 | ac7fb9e | fix(pty): rotate stdout.log at 50 MB (#175) |
 | 0cfc906 | 5f1943e | fix(telegram): HTML parse mode — eliminates silent drops (#181) |
-| d7e3523 | 33bcec3 | fix(cli): invert 1M-context default — opt-in 200K (#201) |
+| d7e3523 | 33bcec3 | fix(cli): invert 1M-context default — opt-in 200K (#201) — ⚠️ **see "Accepted behavior change" below** |
 | 162134f | 3420b5b | fix(test): relative timestamps in channels route test (#226) |
 | 3a24bb9 | 3d7481a | fix(kb): bump ingest timeout + retry Gemini 503s (#309) — **fixes our KB ETIMEDOUT issue** |
 | 9498640 | fae9d85 | fix(metrics): exclude info/warning severity from errors_today (#266) |
@@ -65,10 +75,20 @@ Cherry-pick **reliability-only commits** onto a separate branch (`upstream/relia
 - **Self-healing watchdog scripts** (#327) — opt-in only, deferred
 - **telegram_polling config flag** (#297) — would add new config per agent, deferred
 
+### Accepted behavior change (not a pure reliability fix)
+
+Commit `33bcec3` (`fix(cli): invert 1M-context default`) flips the default context window for **newly created agents** from 200K to 1M tokens (opt-in 200K via flag). This is **labelled "fix" upstream but is a behaviour change with cost and runtime implications**:
+
+- New agents will hold larger context windows by default — affects Anthropic API cost per session and memory pressure.
+- Existing agents are unaffected — they keep whatever was configured at creation time.
+- We accept this change because (a) all 7 current PhytoMedic agents were created before this commit and are unchanged, (b) any future agent we create can be explicitly downgraded with the documented opt-out flag, (c) we are already on 1M-context plans for these agents in practice.
+
+If a future cost regression is traced to a newly created agent, the first thing to check is the opt-out flag.
+
 ## Consequences
 
 ### Positive
-- Zero new features, zero new configs introduced. Behavior identical except for fixed bugs.
+- Zero new features, zero new configs introduced. Behavior identical to before except for fixed bugs and one accepted default change (`33bcec3`, see above).
 - KB-ingest ETIMEDOUT issue (4× consecutive failures) addressed by `3d7481a`.
 - Future merges become easier: 12 commits closer to upstream.
 - Each fix isolated and revertible.
