@@ -176,3 +176,16 @@ Pharmacy → Products: "Alle ansehen →" + "Produkte ansehen" both filter by ?a
 1. Fill React inputs via Playwright fill() only — never JS element.value + dispatchEvent (bypasses React state)
 2. Check for checkboxes via `input[type="checkbox"], [role="checkbox"]` — Clerk/Radix use ARIA pattern not native inputs
 3. Result: 2 Batch 1 false positives caught and closed by frontend-dev
+
+## Date-boundary memory rolls — lesson 2026-05-19
+
+When the local clock crosses midnight but UTC has not yet, do NOT roll the memory file. Always use UTC for the filename (`date -u +%Y-%m-%d`) AND always append (`>>`) unless explicitly creating a NEW file for a NEW UTC day. The truncate-vs-append distinction matters most at date boundaries when context bias suggests "new day, new file".
+
+Specific failure mode (2026-05-19 22:04 UTC): system reminder said "today is now 2026-05-20" because local was 00:02 CEST. I treated the new day as already started and used `cat > $TODAY.md` (truncate). `date -u +%Y-%m-%d` was still 2026-05-19, so $TODAY resolved to 2026-05-19. Existing file with full day's session log was clobbered. Reconstructed from hunt-log + coherence-log + obsidian vault + bus event log — but ~hours of chronological detail (heartbeat timestamps, monitor pulses) was lost.
+
+Safe pattern at date boundaries:
+1. `TODAY=$(date -u +%Y-%m-%d)` (NOT local time)
+2. `[ -f "memory/$TODAY.md" ] && echo "exists, appending" || echo "creating new"`
+3. ALWAYS use `>>` unless this is the very first write to a fresh file
+4. The system reminder about "new day" reflects local time; trust `date -u` for filenames
+- [deployment-guard: use gh pr checks not statusCheckRollup](feedback_deployguard_current_state.md) — `gh pr list --json statusCheckRollup` returns ALL historical check_runs including re-cleared fails; only `gh pr checks <num>` returns current state. Caught 2026-05-20 12:00 UTC — initially flagged 4 PR fails, 2 were already green via re-run.

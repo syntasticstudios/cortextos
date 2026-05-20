@@ -303,7 +303,13 @@ export function ingestKnowledgeBase(
 
   execFileSync(pythonPath, args, {
     encoding: 'utf-8',
-    timeout: 120000,
+    // Whole-vault ingests run ~15-25 min at Gemini embedding rates
+    // (~2s/file × 500+ files). The previous 2-min cap killed every cron
+    // ingest with SIGTERM mid-run, losing all progress. 30-min defensive
+    // bound keeps this from looping forever on a stuck call but is well
+    // above the legitimate worst case. Root-cause documented in
+    // task_1779147158339_08351932 (SYS-DIAG-01).
+    timeout: 30 * 60 * 1000,
     env,
     stdio: 'inherit',
   });
