@@ -586,14 +586,19 @@ export class AgentProcess {
     const onlineMessage = isHandoffRestart
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    // LAZY-MODE STARTUP (2026-05-27 cascade-fix): replaced "Read AGENTS.md and ALL bootstrap files"
+    // with minimal cold-start + immediate work-pull. Old prompt caused agents to spend 1-2min
+    // "thinking" through every bootstrap file then send a redundant Telegram, never reaching
+    // productive task-execution. New prompt = act-first, read-on-demand.
+    return `Cold-start. UTC ${nowUtc}. Read CLAUDE.md for the 4-step lazy checklist. Then IMMEDIATELY: (1) cortextos bus update-heartbeat alive, (2) cortextos bus check-inbox, (3) auto-pull highest-prio task assigned to you: cortextos bus list-tasks --status pending --agent $CTX_AGENT_NAME --format json | head, pick top, cortextos bus update-task <id> in_progress, then WORK ON IT. Crons auto-loaded — do NOT call CronCreate. Skip the "back online" Telegram (silent boot — Founder doesn't need a ping per restart). Lazy-read on demand: GUARDRAILS only before code-touches, MEMORY only for cross-session context.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onboardingAppend}`;
   }
 
   private buildContinuePrompt(): string {
     const nowUtc = new Date().toISOString();
     const reminderBlock = this.buildReminderBlock();
     const deliverablesBlock = this.buildDeliverablesBlock();
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After checking inbox, send a Telegram message to the user saying you are back online.`;
+    // LAZY-MODE CONTINUE (2026-05-27 cascade-fix): same as startup — minimal re-orient, no Telegram, immediate work-pull.
+    return `SESSION CONTINUATION. UTC ${nowUtc}. Conversation history preserved. SKIP re-reading bootstrap files (your CLAUDE.md context is intact). Crons auto-loaded. Just: (1) cortextos bus update-heartbeat alive, (2) cortextos bus check-inbox, (3) resume the task you were in_progress on — OR auto-pull next: cortextos bus list-tasks --status pending --agent $CTX_AGENT_NAME --format json | head, pick top, update-task in_progress, work. Skip the "back online" Telegram.${reminderBlock}${deliverablesBlock}`;
   }
 
   /**
