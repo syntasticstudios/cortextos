@@ -304,6 +304,17 @@ export class AgentProcess {
    */
   async sessionRefresh(): Promise<void> {
     this.log('Session refresh (--continue restart)');
+    // Write the `.session-refresh` marker BEFORE stop() so the SessionEnd
+    // crash-alert hook (a separate process triggered by the Claude Code exit)
+    // classifies this planned rotation as `session-refresh` (friendly ♻️) and
+    // does NOT count it as a crash. Without this marker the hook defaults to
+    // `endType='crash'`, firing a misleading "🚨 CRASH: died unexpectedly.
+    // Crashes today: N" Telegram on every 12h max_session_seconds rotation.
+    // The hook reads + unlinks the marker, so it fires exactly once.
+    try {
+      const markerPath = join(this.env.ctxRoot, 'state', this.name, '.session-refresh');
+      writeFileSync(markerPath, `max_session_seconds rotation ${new Date().toISOString()}`, 'utf-8');
+    } catch { /* best-effort: a missing marker only affects alert labeling */ }
     await this.stop();
     await this.start();
     this.log('Session refreshed');
