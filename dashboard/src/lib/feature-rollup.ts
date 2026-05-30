@@ -74,7 +74,7 @@ export function buildOverview(tasks: Task[]): Overview {
     const blocked = ft.filter((t) => t.status === 'blocked').length;
     const total = ft.length;
     const urgentOpen = ft.filter((t) => !isDone(t.status) && t.priority === 'urgent').length;
-    const owners = Array.from(new Set(ft.filter((t) => !isDone(t.status) && t.assignee).map((t) => t.assignee))).sort();
+    const owners = Array.from(new Set(ft.filter((t) => !isDone(t.status) && t.assignee).map((t) => t.assignee as string))).sort();
     features.push({ feature, totals: { done, inProgress, pending, blocked, total }, percentDone: total > 0 ? Math.round((done / total) * 100) : 0, urgentOpen, owners });
   }
 
