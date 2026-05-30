@@ -29,7 +29,16 @@ export const FEATURE_RULES: { feature: string; match: RegExp }[] = [
   { feature: 'Sync & Provider', match: /ARCH-CONVEX-SYNC|cannaleo|higreen|provider|normalization|offer/i },
   { feature: 'Infra & Kosten', match: /ARCH-CONVEX|\bCRON|stampede|convex|token|cost|kosten/i },
   { feature: 'Fleet-Selbstverbesserung', match: /CORTEXT-IMPROVE|cortextos|watchdog|cascade/i },
-  { feature: 'Tech-Debt & Incidents', match: /TECH-DEBT|INCIDENT|POST-MORTEM|URGENT-INCIDENT|refactor/i },
+  { feature: 'Tech-Debt & Incidents', match: /TECH-DEBT|INCIDENT|POST-MORTEM|URGENT-INCIDENT|refactor|\bBUG\b|BUG-SWEEP/i },
+  // --- appended buckets: only catch tasks that fall through the rules above ---
+  { feature: 'Arzt & Verifizierung', match: /\barzt|\bärzt|doctor|verifizier|verification|arbeitszeit|approbation|\bLANR\b/i },
+  { feature: 'Patient & Fragebogen', match: /patient|fragebogen|questionnaire|anamnese|notify-me|widerruf/i },
+  { feature: 'Katalog & Produkte', match: /\bprodukt|\bproduct|katalog|catalog|\bCBD\b|\bsorte|strain|marketdata/i },
+  { feature: 'Sammelbestellung', match: /sammelbestell|group-purchase|gruppenbestell/i },
+  { feature: 'Analytics & KPIs', match: /cannametrics|\bKPI|marktanalyse|analytics|ranking|aggregation/i },
+  { feature: 'Compliance & Recht', match: /DSGVO|GDPR|\bHWG\b|\bBTM|compliance|datenschutz|audit-log|\blegal\b/i },
+  { feature: 'Marketing & SEO', match: /\bSEO|marketing|landing-page|\bblog\b/i },
+  { feature: 'Tests & QA', match: /\bQA\b|\btests?\b|e2e|playwright|vitest/i },
 ];
 
 export const FALLBACK_FEATURE = 'Sonstiges';

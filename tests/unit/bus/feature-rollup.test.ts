@@ -43,8 +43,27 @@ describe('classifyFeature', () => {
     expect(classifyFeature(mkTask('6', '[REZEPT] Gebühren 11.90', 'pending'))).toBe('Rezeptgebühren');
     expect(classifyFeature(mkTask('7', '[APOTHEKE] dashboard Einkauf', 'pending'))).toBe('Apotheken-Dashboard');
   });
+  it('maps the appended domain buckets', () => {
+    expect(classifyFeature(mkTask('a1', '[ARZT-VERIFY] Arbeitszeiten fehlen', 'pending'))).toBe('Arzt & Verifizierung');
+    expect(classifyFeature(mkTask('a2', '[PATIENT] Fragebogen Anamnese', 'pending'))).toBe('Patient & Fragebogen');
+    expect(classifyFeature(mkTask('a3', '[CATALOG] Produkte CBD Sorten', 'pending'))).toBe('Katalog & Produkte');
+    expect(classifyFeature(mkTask('a4', '[ORDER] Sammelbestellung deadline', 'pending'))).toBe('Sammelbestellung');
+    expect(classifyFeature(mkTask('a5', '[ANALYTICS] Marktanalyse KPI ranking', 'pending'))).toBe('Analytics & KPIs');
+    expect(classifyFeature(mkTask('a6', '[DSGVO] Löschrecht HWG audit-log', 'pending'))).toBe('Compliance & Recht');
+    expect(classifyFeature(mkTask('a7', '[SEO] landing-page marketing', 'pending'))).toBe('Marketing & SEO');
+    expect(classifyFeature(mkTask('a8', '[QA] e2e playwright tests', 'pending'))).toBe('Tests & QA');
+    expect(classifyFeature(mkTask('a9', '[BUG-SWEEP] fix broken images', 'pending'))).toBe('Tech-Debt & Incidents');
+  });
+
+  it('appended rules do not steal from earlier buckets (first-match wins)', () => {
+    // "pharmacy" must stay Apotheken-Dashboard even though Analytics has no claim;
+    // "manufacturer" stays B2B even though it is also a catalog-ish word.
+    expect(classifyFeature(mkTask('p1', '[APOTHEKE] pharmacy product list', 'pending'))).toBe('Apotheken-Dashboard');
+    expect(classifyFeature(mkTask('p2', '[B2B-SCHEMA-1] manufacturer contracts', 'pending'))).toBe('B2B-Verträge & Hersteller');
+  });
+
   it('falls back to Sonstiges for unknown/untagged', () => {
-    expect(classifyFeature(mkTask('8', 'some random task', 'pending'))).toBe(FALLBACK_FEATURE);
+    expect(classifyFeature(mkTask('8', 'zzz quux blorp', 'pending'))).toBe(FALLBACK_FEATURE);
   });
 });
 
