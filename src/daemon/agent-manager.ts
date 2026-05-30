@@ -28,7 +28,7 @@ export class AgentManager {
   private cronSchedulers: Map<string, CronScheduler> = new Map();
   // Tracks agents that received a start request while still stopping.
   // stopAgent() honors these after cleanup completes so restart-all is race-free.
-  private pendingRestarts: Set<string> = new Set();
+  // pendingRestarts removed: idempotent skip in startAgent() makes the queue unnecessary
   private instanceId: string;
   private ctxRoot: string;
   private frameworkRoot: string;
@@ -54,22 +54,26 @@ export class AgentManager {
     // re-discover and re-start any agent dir on disk regardless of user intent.
     const instanceEnabled = this.readInstanceEnableList();
 
-    for (const { name, dir, org, config } of agentDirs) {
-      // Per-agent config.json `enabled: false` (existing behavior, unchanged)
+    const toStart = agentDirs.filter(({ name, config }) => {
       if (config.enabled === false) {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (per-agent config.json)`);
-        continue;
+        return false;
       }
-      // Instance-level enabled-agents.json `enabled: false` (BUG-028 fix)
       const entry = instanceEnabled[name];
       if (entry && entry.enabled === false) {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (enabled-agents.json)`);
-        continue;
+        return false;
       }
-      // BUG-043 fix: pass the per-agent org so startAgent can use it instead
-      // of falling back to `this.org` (the daemon's startup org).
-      await this.startAgent(name, dir, config, org);
-    }
+      return true;
+    });
+
+    // Parallel startup: eliminates the sequential blocking window that caused
+    // external IPC start-agent calls to race with discoverAndStart and trigger
+    // the BUG-011 pendingRestarts cascade. Each agent's startup_delay now runs
+    // concurrently instead of blocking the whole queue.
+    await Promise.allSettled(
+      toStart.map(({ name, dir, config, org }) => this.startAgent(name, dir, config, org)),
+    );
   }
 
   /**
@@ -144,23 +148,37 @@ export class AgentManager {
    * spawn each agent in its correct org dir regardless of what
    * `CTX_ORG` the daemon was started with.
    */
+  /**
+   * Synchronously classify a start/stop/restart request before dispatch.
+   *
+   * Lets the IPC handler distinguish DEDUPED (agent already in registry, so
+   * a start is collapsing against an in-flight identical op — or a stop /
+   * restart of an agent that was just removed) from NOT_FOUND (agent never
+   * existed in the registry). The dedup logic in startAgent / stopAgent /
+   * restartAgent is unchanged — this read-only check exists purely to give
+   * the IPC layer enough info to set IPCResponse.code. See issue #346.
+   */
+  inspectAgentOp(op: 'start' | 'stop' | 'restart', name: string): { ok: true } | { ok: false; code: 'DEDUPED' | 'NOT_FOUND'; message: string } {
+    const inRegistry = this.agents.has(name);
+    if (op === 'start') {
+      if (inRegistry) {
+        return { ok: false, code: 'DEDUPED', message: `start request for "${name}" deduped — agent already in registry (in-flight start or already running)` };
+      }
+      return { ok: true };
+    }
+    // stop / restart need the agent to be present
+    if (!inRegistry) {
+      return { ok: false, code: 'NOT_FOUND', message: `agent "${name}" not in registry — cannot ${op}` };
+    }
+    return { ok: true };
+  }
+
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
     if (this.agents.has(name)) {
-      // BUG-031: this branch was the workaround for the BUG-011 PTY race
-      // (restart-all could send stop+start simultaneously, and the new
-      // start would arrive while the old stop's PTY exit was still in
-      // flight). PR #11 closed BUG-011 by making `AgentProcess.stop()`
-      // await the actual PTY exit before resolving — which means this
-      // branch should NEVER fire under normal restart paths.
-      //
-      // We log a regression warning here instead of deleting the branch
-      // entirely, so we'll know IMMEDIATELY if BUG-011 ever regresses
-      // (a future change accidentally breaks the exit-await). Phase 4 of
-      // the core stability test plan + cycle 2 of PR #13 both confirmed
-      // this branch is dormant. Once we have weeks of zero-warning
-      // production data, we can delete the queue mechanism entirely.
-      console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
-      this.pendingRestarts.add(name);
+      // Idempotent: a second start() for an already-running agent is a no-op.
+      // This replaces the old pendingRestarts cascade that turned IPC/startup
+      // races into silent restart loops (root cause of the 3-agent dropout bug).
+      console.log(`[agent-manager] start(${name}) skipped — already in registry (idempotent; no restart queued)`);
       return;
     }
 
@@ -585,19 +603,6 @@ export class AgentManager {
       this.cronSchedulers.delete(name);
     }
 
-    // BUG-031: honor any restart that was queued while we were stopping.
-    // After PR #11 (BUG-011 fix) this branch should never fire — see the
-    // matching warning comment in startAgent(). The honor logic is preserved
-    // as a safety net in case BUG-011 regresses; the warn line tells us
-    // immediately if it ever does.
-    if (this.pendingRestarts.has(name)) {
-      console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: pendingRestarts fired for ${name} — race condition leaked through. Honoring queued restart as safety net.`);
-      this.pendingRestarts.delete(name);
-      console.log(`[agent-manager] Honoring queued restart for ${name}`);
-      this.startAgent(name, '').catch(err =>
-        console.error(`[agent-manager] Queued restart failed for ${name}:`, err),
-      );
-    }
   }
 
   /**
@@ -609,7 +614,6 @@ export class AgentManager {
    * credentials are re-read from {agentDir}/.env on each restart.
    *
    * agentDir is auto-discovered by startAgent() from frameworkRoot/orgs/{org}/agents/{name}.
-   * Participates in the pendingRestarts race protection used by restart-all.
    */
   async restartAgent(name: string): Promise<void> {
     if (!this.agents.has(name)) {
@@ -742,7 +746,7 @@ export class AgentManager {
       }, 30_000); // keep for 30s after exit
     });
 
-    await worker.spawn({ ...env, ...(model ? {} : {}) }, prompt);
+    await worker.spawn(env, prompt, config);
   }
 
   /**
@@ -772,9 +776,23 @@ export class AgentManager {
    * Returns true if the agent is running and the inject succeeded; false otherwise.
    */
   injectAgent(agentName: string, text: string): boolean {
+    return this.injectAgentDetailed(agentName, text).ok;
+  }
+
+  /**
+   * Inject text into an agent's PTY with structured outcome — issue #346.
+   *
+   * Returns NOT_FOUND if the agent isn't in the registry, NOT_RUNNING if
+   * registered but the PTY is gone, DEDUPED on a MessageDedup hash hit. The
+   * boolean-returning `injectAgent()` is preserved for callers (cron
+   * scheduler, fast-checker, fire-cron) that only need pass/fail.
+   */
+  injectAgentDetailed(agentName: string, text: string): { ok: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING' | 'DEDUPED'; message: string } {
     const entry = this.agents.get(agentName);
-    if (!entry) return false;
-    return entry.process.injectMessage(text);
+    if (!entry) {
+      return { ok: false, code: 'NOT_FOUND', message: `agent "${agentName}" not in registry` };
+    }
+    return entry.process.injectMessageDetailed(text);
   }
 
   /**
@@ -942,17 +960,44 @@ export class AgentManager {
 
   /**
    * Load agent config from config.json.
+   *
+   * On parse error: log a clear, operator-actionable error to stderr (file path,
+   * SyntaxError message, and a 1-line offending-snippet hint when locatable) and
+   * fall back to default config so the daemon does not hard-crash. Without this
+   * surfacing, a trailing comma in config.json silently degrades the agent into
+   * a "model not available" state because the model field is missing — see #345.
    */
   private loadAgentConfig(agentDir: string): AgentConfig {
     const configPath = join(agentDir, 'config.json');
+    if (!existsSync(configPath)) return {};
+    let raw: string;
     try {
-      if (existsSync(configPath)) {
-        return JSON.parse(readFileSync(configPath, 'utf-8'));
-      }
-    } catch {
-      // Ignore parse errors
+      raw = readFileSync(configPath, 'utf-8');
+    } catch (err) {
+      console.error(`[agent-manager] config read failed: ${configPath}: ${(err as Error).message}`);
+      return {};
     }
-    return {}; // Default config
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      const msg = (err as SyntaxError).message;
+      // Best-effort line/column extraction from V8 SyntaxError messages.
+      // V8 emits "Unexpected token ... in JSON at position N" — we resolve
+      // N back to a 1-indexed line/column so operators can jump to the offender.
+      const posMatch = /position (\d+)/.exec(msg);
+      let locHint = '';
+      if (posMatch) {
+        const pos = Math.min(Number(posMatch[1]), raw.length);
+        const before = raw.slice(0, pos);
+        const line = before.split('\n').length;
+        const col = pos - (before.lastIndexOf('\n') + 1) + 1;
+        const offendingLine = raw.split('\n')[line - 1] || '';
+        locHint = ` (line ${line}, col ${col}: \`${offendingLine.trim().slice(0, 80)}\`)`;
+      }
+      console.error(`[agent-manager] config.json invalid JSON: ${configPath}${locHint}: ${msg}`);
+      console.error(`[agent-manager] hint: trailing commas, unquoted keys, and single quotes are common causes`);
+      return {};
+    }
   }
 }
 

@@ -123,6 +123,12 @@ export class AgentPTY {
     } else if (process.env.TZ) {
       ptyEnv['CTX_TIMEZONE'] = process.env.TZ;
     }
+    // Daemon-managed sessions never need in-process auto-update — SDK updates happen
+    // via npm at daemon-restart-time. Without this, agents can freeze for >30 min
+    // in a "Checking for updates" animation loop, burning stdout with 99-byte ticks
+    // and producing no agent work. Observed on BA/FE/PO sessions (2026-05-26).
+    ptyEnv['CLAUDE_CODE_DISABLE_AUTOUPDATE'] = 'true';
+    ptyEnv['DISABLE_AUTOUPDATER'] = 'true';
     // FIX #3 (2026-05-26): disable claude-code auto-update check that freezes sessions
     // in update-check loop. Observed BA/FE/PO stuck in "Checking for updates" for >30min
     // while burning 99 bytes stdout (pure UI animation, no agent work).
