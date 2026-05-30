@@ -7,8 +7,6 @@ import { getHealthSummary, getAllHeartbeats } from '@/lib/data/heartbeats';
 import { getRecentEvents, getMilestones } from '@/lib/data/events';
 import { discoverAgents } from '@/lib/data/agents';
 
-import { buildOverview } from '@/lib/feature-rollup';
-import { FeatureOverview } from '@/components/feature-overview';
 import { ActionRequired } from '@/components/overview/action-required';
 import { CurrentFocus } from '@/components/overview/current-focus';
 import { TodaysProgress } from '@/components/overview/todays-progress';
@@ -67,9 +65,6 @@ export default async function OverviewPage({
   const humanTasks = allTasks.filter(t => t.assignee === 'human' && t.status !== 'completed').length;
   const totalActions = pendingCount + blockedTasks.length + staleAgentCount + humanTasks;
 
-  // Feature-level rollup derived live from task [TAG]s.
-  const overview = buildOverview(allTasks);
-
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -90,9 +85,6 @@ export default async function OverviewPage({
           </Link>
         )}
       </div>
-
-      {/* Feature-level project progress (PhytoMedic) */}
-      <FeatureOverview overview={overview} />
 
       {/* Metric Cards */}
       <MetricCards
