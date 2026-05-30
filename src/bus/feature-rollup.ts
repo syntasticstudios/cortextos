@@ -39,6 +39,7 @@ export const FEATURE_RULES: { feature: string; match: RegExp }[] = [
   { feature: 'Compliance & Recht', match: /DSGVO|GDPR|\bHWG\b|\bBTM|compliance|datenschutz|audit-log|\blegal\b/i },
   { feature: 'Marketing & SEO', match: /\bSEO|marketing|landing-page|\bblog\b/i },
   { feature: 'Tests & QA', match: /\bQA\b|\btests?\b|e2e|playwright|vitest/i },
+  { feature: 'Audit & Qualität', match: /GAP-AUDIT|AUDIT-MASTER|A11Y|consistency-sweep/i },
 ];
 
 export const FALLBACK_FEATURE = 'Sonstiges';

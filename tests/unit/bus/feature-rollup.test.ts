@@ -53,6 +53,8 @@ describe('classifyFeature', () => {
     expect(classifyFeature(mkTask('a7', '[SEO] landing-page marketing', 'pending'))).toBe('Marketing & SEO');
     expect(classifyFeature(mkTask('a8', '[QA] e2e playwright tests', 'pending'))).toBe('Tests & QA');
     expect(classifyFeature(mkTask('a9', '[BUG-SWEEP] fix broken images', 'pending'))).toBe('Tech-Debt & Incidents');
+    expect(classifyFeature(mkTask('a10', '[GAP-AUDIT-N-PLUS-1-QUERIES] fix queries', 'pending'))).toBe('Audit & Qualität');
+    expect(classifyFeature(mkTask('a11', '[FOUNDER-LIVE-AUDIT-MASTER] sweep', 'pending'))).toBe('Audit & Qualität');
   });
 
   it('appended rules do not steal from earlier buckets (first-match wins)', () => {
