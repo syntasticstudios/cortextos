@@ -6,6 +6,8 @@ import { getGoals } from '@/lib/data/goals';
 import { getHealthSummary, getAllHeartbeats } from '@/lib/data/heartbeats';
 import { getRecentEvents, getMilestones } from '@/lib/data/events';
 import { discoverAgents } from '@/lib/data/agents';
+import { FeatureOverview } from '@/components/feature-overview';
+import { buildOverview } from '@/lib/feature-rollup';
 
 import { FeatureOverview } from '@/components/feature-overview';
 import { buildOverview } from '@/lib/feature-rollup';
