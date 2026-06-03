@@ -249,9 +249,37 @@ class Daemon {
 
     console.log(`[daemon] Running (pid: ${process.pid})`);
 
+    // Fleet-online summary: after a (re)start, send ONE operator message with the
+    // up/total agent count. Without this, operators only ever see per-agent "stopped"
+    // notifications (cortextos stop / daemon shutdown) and never a paired "started"
+    // signal — so a routine restart reads as "the fleet is dead". Sent best-effort via
+    // the same curl path as crash alerts (works even when the inbound poller is
+    // network-degraded). Delayed so agents have settled past 'starting'. Cleared on a
+    // fast start→stop so a teardown can't be followed by a stale "online".
+    const bootSummaryTimer = setTimeout(() => {
+      try {
+        const statuses = this.agentManager?.getAllStatuses() ?? [];
+        const total = statuses.length;
+        if (total === 0) return;
+        const isUp = (s: { status: string }) => s.status === 'running' || s.status === 'starting';
+        const up = statuses.filter(isUp).length;
+        const down = statuses.filter((s) => !isUp(s));
+        const msg = down.length === 0
+          ? `✅ cortextos: fleet online — ${up}/${total} agents up.`
+          : `✅ cortextos: fleet started — ${up}/${total} agents up. Down: ${down.map((s) => `${s.name} (${s.status})`).join(', ')}.`;
+        sendOperatorAlertBestEffort(frameworkRoot, msg);
+      } catch {
+        /* best-effort — the boot summary must never crash the daemon */
+      }
+    }, Number(process.env.CTX_BOOT_SUMMARY_DELAY_MS) || 30_000);
+    if (typeof bootSummaryTimer.unref === 'function') bootSummaryTimer.unref();
+
     // Handle shutdown signals
     const shutdown = async () => {
       console.log('[daemon] Shutting down...');
+      // Cancel a pending fleet-online summary so a fast start→stop never emits a
+      // stale "online" right after "shutting down".
+      clearTimeout(bootSummaryTimer);
       // Stop the watchdogs FIRST, before stopAll(), so no in-flight tick can
       // restart an agent (stale watchdog) or regenerate the board mid-teardown.
       if (this.staleWatchdog) {
