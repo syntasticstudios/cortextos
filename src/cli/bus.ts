@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, selectAndClaimNext, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -153,7 +153,9 @@ busCommand
   .option('--needs-approval', 'Require human approval before execution')
   .option('--blocked-by <ids>', 'Comma-separated task IDs that must complete before this task can progress')
   .option('--blocks <ids>', 'Comma-separated task IDs that this new task will block (symmetric reverse edge)')
-  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+  .option('--bundle <id>', 'Feature-bundle id this task belongs to (coordinated work; see AGENTS.md)')
+  .option('--role <role>', 'Product role this sub-task covers (patient, doctor, pharmacy, manufacturer, admin)')
+  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string; bundle?: string; role?: string }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
@@ -165,6 +167,8 @@ busCommand
       needsApproval: opts.needsApproval ?? false,
       blockedBy: parseList(opts.blockedBy),
       blocks: parseList(opts.blocks),
+      bundle: opts.bundle,
+      role: opts.role,
     });
     console.log(taskId);
     // Auto-notify assignee so the task is visible immediately (issue #78)
@@ -284,6 +288,36 @@ busCommand
     try {
       const task = claimTask(paths, id, agent);
       console.log(`Claimed ${id} -> in_progress (assigned to ${agent})`);
+      console.log(`  Title: ${task.title}`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('claim-next')
+  .description('Atomically claim the next workable task of a feature-bundle (coordinated work). Selects pending, dependency-met tasks for --bundle (optionally --role), DAG-ordered, and claims the first — the way builder agents pull coordinated work instead of isolated random tasks.')
+  .requiredOption('--bundle <id>', 'Feature-bundle id to pull the next task from')
+  .option('--role <role>', 'Only claim a sub-task for this product role')
+  .option('--agent <name>', 'Agent claiming the task (defaults to CTX_AGENT_NAME)')
+  .action((opts: { bundle: string; role?: string; agent?: string }) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const agent = opts.agent || env.agentName;
+    if (!agent) {
+      console.error('ERROR: --agent or CTX_AGENT_NAME required');
+      process.exit(1);
+    }
+    try {
+      const task = selectAndClaimNext(paths, agent, { bundle: opts.bundle, role: opts.role });
+      if (!task) {
+        const scope = opts.role ? `bundle ${opts.bundle} / role ${opts.role}` : `bundle ${opts.bundle}`;
+        console.log(`No workable (pending, dependency-met) task in ${scope}.`);
+        return;
+      }
+      console.log(`Claimed ${task.id} -> in_progress (assigned to ${agent})`);
+      console.log(`  Bundle: ${task.bundle_id ?? '-'}${task.role ? ` / role ${task.role}` : ''}`);
       console.log(`  Title: ${task.title}`);
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
