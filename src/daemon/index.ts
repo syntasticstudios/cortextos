@@ -38,6 +38,16 @@ export const CRASH_LOOP_WINDOW_MS = 15 * 60 * 1000;    // 15 min detection windo
 export const CRASH_LOOP_THRESHOLD = 3;                  // 3 crashes trips the alert
 export const CRASH_LOOP_COOLDOWN_MS = 30 * 60 * 1000;   // 30 min between alerts
 
+/**
+ * Whether the stale-agent watchdog should be armed. OFF by default: the fleet's
+ * "pause" is implemented by the daemon being down while agents stay enabled with
+ * now-stale heartbeats, so an always-on watchdog would force-restart the whole
+ * paused fleet on the next `pm2 start`. Arming is a deliberate operator act.
+ */
+export function staleWatchdogEnabled(): boolean {
+  return process.env.CTX_STALE_WATCHDOG === '1';
+}
+
 export function crashHistoryPath(ctxRoot: string): string {
   return join(ctxRoot, 'state', '.daemon-crash-history.json');
 }
@@ -168,6 +178,7 @@ class Daemon {
   private agentManager: AgentManager | null = null;
   private ipcServer: IPCServer | null = null;
   private vaultWatchdog: VaultLivenessWatchdog | null = null;
+  private staleWatchdog: StaleAgentWatchdog | null = null;
   private instanceId: string;
   private ctxRoot: string;
 
@@ -214,12 +225,25 @@ class Daemon {
     // Discover and start agents
     await this.agentManager.discoverAndStart();
 
+    // Stale-agent watchdog: auto-restarts agents whose heartbeat has gone stale
+    // (rate-limit aware, crash-budgeted). OFF BY DEFAULT — the fleet's "pause" is
+    // just the daemon being down while every agent stays enabled with a now-stale
+    // heartbeat, so an always-on watchdog would force-restart the whole paused fleet
+    // on the next `pm2 start`. Arming it is a deliberate operator act: set
+    // CTX_STALE_WATCHDOG=1. (This wires the previously-orphaned import.)
+    if (staleWatchdogEnabled()) {
+      this.staleWatchdog = new StaleAgentWatchdog(this.agentManager, this.ctxRoot, frameworkRoot);
+      this.staleWatchdog.start();
+      console.log('[daemon] StaleAgentWatchdog armed (CTX_STALE_WATCHDOG=1)');
+    } else {
+      console.log('[daemon] StaleAgentWatchdog present but DISABLED (set CTX_STALE_WATCHDOG=1 to arm)');
+    }
+
     // Keep the vault coordination layer alive: regenerate agent-shared/active-tasks.md
     // from the live bus every cycle (replacing the dead cron-prompt updater) and alert
     // when the narrative state (project-state.md) goes stale. Without this the board
     // freezes on its placeholder and the fleet loses shared visibility (the root cause
-    // of duplicate work). NOTE: the StaleAgentWatchdog imported above is still NOT wired
-    // into start() — tracked separately; this PR wires the vault watchdog only.
+    // of duplicate work).
     this.vaultWatchdog = new VaultLivenessWatchdog(this.instanceId, org, frameworkRoot);
     this.vaultWatchdog.start();
 
@@ -228,15 +252,20 @@ class Daemon {
     // Handle shutdown signals
     const shutdown = async () => {
       console.log('[daemon] Shutting down...');
+      // Stop the watchdogs FIRST, before stopAll(), so no in-flight tick can
+      // restart an agent (stale watchdog) or regenerate the board mid-teardown.
+      if (this.staleWatchdog) {
+        this.staleWatchdog.stop();
+      }
+      if (this.vaultWatchdog) {
+        this.vaultWatchdog.stop();
+      }
       try {
         if (this.agentManager) {
           await this.agentManager.stopAll();
         }
       } catch (err) {
         console.error('[daemon] Error during shutdown:', err);
-      }
-      if (this.vaultWatchdog) {
-        this.vaultWatchdog.stop();
       }
       if (this.ipcServer) {
         this.ipcServer.stop();
