@@ -1,8 +1,9 @@
 import { AgentManager } from './agent-manager.js';
 import { IPCServer } from './ipc-server.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
-import { spawnSync } from 'child_process';
 import { StaleAgentWatchdog } from './stale-watchdog.js';
+import { VaultLivenessWatchdog } from './vault-liveness-watchdog.js';
+import { sendOperatorAlertBestEffort } from './operator-alert.js';
 import { SleepScheduler } from './sleep-scheduler.js';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -36,7 +37,6 @@ export const CRASH_HISTORY_MAX = 20;
 export const CRASH_LOOP_WINDOW_MS = 15 * 60 * 1000;    // 15 min detection window
 export const CRASH_LOOP_THRESHOLD = 3;                  // 3 crashes trips the alert
 export const CRASH_LOOP_COOLDOWN_MS = 30 * 60 * 1000;   // 30 min between alerts
-const TELEGRAM_SEND_TIMEOUT_MS = 3000;           // bounded — we're crashing
 
 export function crashHistoryPath(ctxRoot: string): string {
   return join(ctxRoot, 'state', '.daemon-crash-history.json');
@@ -112,76 +112,21 @@ export function writeDaemonCrashedMarkers(ctxRoot: string): void {
   }
 }
 
-function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken: string } | null {
-  // Priority 1: explicit operator env (recommended for production).
-  const envChat = process.env.CTX_OPERATOR_CHAT_ID;
-  const envToken = process.env.CTX_OPERATOR_BOT_TOKEN;
-  if (envChat && envToken && /^\d+:[A-Za-z0-9_-]+$/.test(envToken)) {
-    return { chatId: envChat, botToken: envToken };
-  }
-  // Priority 2: fall back to the first agent's .env. Good enough for
-  // small single-operator installs — alert still lands SOMEWHERE visible.
-  try {
-    const orgsRoot = join(frameworkRoot, 'orgs');
-    if (!existsSync(orgsRoot)) return null;
-    const orgs = readdirSync(orgsRoot, { withFileTypes: true }).filter(d => d.isDirectory());
-    for (const org of orgs) {
-      const agentsRoot = join(orgsRoot, org.name, 'agents');
-      if (!existsSync(agentsRoot)) continue;
-      const agents = readdirSync(agentsRoot, { withFileTypes: true }).filter(d => d.isDirectory());
-      for (const a of agents) {
-        const envFile = join(agentsRoot, a.name, '.env');
-        if (!existsSync(envFile)) continue;
-        try {
-          const content = readFileSync(envFile, 'utf-8');
-          const tokenMatch = content.match(/^BOT_TOKEN=(.+)$/m);
-          const chatMatch = content.match(/^CHAT_ID=(.+)$/m);
-          if (!tokenMatch || !chatMatch) continue;
-          const botToken = tokenMatch[1].trim();
-          const chatId = envChat || chatMatch[1].trim();
-          if (/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
-            return { chatId, botToken };
-          }
-        } catch { /* skip this agent */ }
-      }
-    }
-  } catch { /* fall through */ }
-  return null;
-}
-
 function sendCrashLoopAlertBestEffort(
   frameworkRoot: string,
   crashCount: number,
   errStr: string,
 ): boolean {
-  const creds = getOperatorChatCreds(frameworkRoot);
-  if (!creds) {
-    console.error('[daemon] Crash-loop alert: no operator chat configured ' +
-      '(set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN, or ensure at least one agent .env exists)');
-    return false;
-  }
   const message =
     `🚨 CRITICAL: cortextos daemon is crash-looping\n` +
     `${crashCount} crashes in 15 minutes\n` +
     `Last error: ${errStr.slice(0, 500)}\n` +
     `Next alert in 30 min if the pattern continues.`;
-  try {
-    const r = spawnSync('curl', [
-      '-s', '--max-time', '3',
-      '-X', 'POST',
-      `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
-      '-d', `chat_id=${creds.chatId}`,
-      '--data-urlencode', `text=${message}`,
-    ], { timeout: TELEGRAM_SEND_TIMEOUT_MS, stdio: 'pipe' });
-    if (r.status === 0) {
-      console.error('[daemon] Crash-loop alert sent to operator chat');
-      return true;
-    }
-    console.error('[daemon] Crash-loop alert send failed (non-fatal)');
-    return false;
-  } catch {
-    return false;
-  }
+  const sent = sendOperatorAlertBestEffort(frameworkRoot, message);
+  console.error(sent
+    ? '[daemon] Crash-loop alert sent to operator chat'
+    : '[daemon] Crash-loop alert not delivered (no operator chat configured or send failed)');
+  return sent;
 }
 
 /**
@@ -222,6 +167,7 @@ function handleFatal(
 class Daemon {
   private agentManager: AgentManager | null = null;
   private ipcServer: IPCServer | null = null;
+  private vaultWatchdog: VaultLivenessWatchdog | null = null;
   private instanceId: string;
   private ctxRoot: string;
 
@@ -268,6 +214,15 @@ class Daemon {
     // Discover and start agents
     await this.agentManager.discoverAndStart();
 
+    // Keep the vault coordination layer alive: regenerate agent-shared/active-tasks.md
+    // from the live bus every cycle (replacing the dead cron-prompt updater) and alert
+    // when the narrative state (project-state.md) goes stale. Without this the board
+    // freezes on its placeholder and the fleet loses shared visibility (the root cause
+    // of duplicate work). NOTE: the StaleAgentWatchdog imported above is still NOT wired
+    // into start() — tracked separately; this PR wires the vault watchdog only.
+    this.vaultWatchdog = new VaultLivenessWatchdog(this.instanceId, org, frameworkRoot);
+    this.vaultWatchdog.start();
+
     console.log(`[daemon] Running (pid: ${process.pid})`);
 
     // Handle shutdown signals
@@ -279,6 +234,9 @@ class Daemon {
         }
       } catch (err) {
         console.error('[daemon] Error during shutdown:', err);
+      }
+      if (this.vaultWatchdog) {
+        this.vaultWatchdog.stop();
       }
       if (this.ipcServer) {
         this.ipcServer.stop();
