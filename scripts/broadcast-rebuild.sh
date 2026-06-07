@@ -18,7 +18,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
 
 MERGE_SHA=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
-REBUILD_MSG="[cortextos-rebuild] origin/main advanced to $MERGE_SHA. Rebuild: cd $REPO_ROOT && git merge origin/main && npm run build"
+REBUILD_MSG="[cortextos-rebuild] cortextos-improver rebuilt dist to $MERGE_SHA. Shared binary updated — pick up on next cold-start. No action needed unless you own a separate cortextos checkout."
 
 if ! command -v cortextos &>/dev/null; then
   echo "[broadcast-rebuild] WARNING: cortextos CLI not in PATH — skipping broadcast" >&2
