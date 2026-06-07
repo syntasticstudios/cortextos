@@ -23,6 +23,12 @@ export interface AssigneeMetrics {
   in_progress: number;
   /** completed / (completed + pending), or null when both are 0 */
   completion_ratio: number | null;
+  /**
+   * Size of the largest title-prefix or bundle_id group among in-progress tasks.
+   * Used by detectAnomalies to suppress wip_cap_breach when the excess is a
+   * coherent bundle (healthy batching) rather than scattered context-switching.
+   */
+  in_progress_bundle_max: number;
 }
 
 export interface AuthoringMetrics {
@@ -155,6 +161,8 @@ interface TaskRecord {
   status?: string;
   created_at?: string;
   archived?: boolean;
+  title?: string;
+  bundle_id?: string;
 }
 
 /**
@@ -197,6 +205,17 @@ function countInboxRequests(eventFiles: string[]): number {
 }
 
 /**
+ * Derive a grouping key for a task title. Returns the first `[TAG]` bracket
+ * token if present (e.g. "[T-A] foo" → "t-a"), otherwise the first two
+ * whitespace-delimited words lowercased. Used for bundle-context detection.
+ */
+function logicalPrefix(title: string): string {
+  const bracketMatch = title.match(/^\[([^\]]+)\]/);
+  if (bracketMatch) return bracketMatch[1].toLowerCase();
+  return title.trim().toLowerCase().split(/\s+/).slice(0, 2).join(' ');
+}
+
+/**
  * Apply per-role anomaly thresholds. Returns the firing anomaly tokens.
  * Empty array = healthy. Tokens are stable strings consumers can match on.
  */
@@ -215,7 +234,15 @@ function detectAnomalies(role: RoleConfig, metrics: Omit<RoleMetrics, 'anomalies
       out.push('assignee_low_completion_ratio');
     }
     if (typeof t.wip_cap_max === 'number' && metrics.assignee.in_progress > t.wip_cap_max) {
-      out.push('assignee_wip_cap_breach');
+      // Bundle-context suppression: if the excess above wip_cap is entirely
+      // explained by one coherent bundle (≥3 tasks sharing a prefix/bundle_id),
+      // the agent is doing healthy batching — not scattered context-switching.
+      const bundleMax = metrics.assignee.in_progress_bundle_max;
+      const nonBundleCount = metrics.assignee.in_progress - bundleMax;
+      const isBundling = bundleMax >= 3 && nonBundleCount < t.wip_cap_max;
+      if (!isBundling) {
+        out.push('assignee_wip_cap_breach');
+      }
     }
   }
   if (wantsAuthoring) {
@@ -367,12 +394,32 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       } catch { /* stale by default */ }
     }
 
+    // Compute bundle-group max for WIP-cap suppression.
+    // Group in-progress tasks by bundle_id if present, else by logicalPrefix(title).
+    // Tasks with no title AND no bundle_id get a unique key so they never
+    // inflate a bundle group — absence of a title is not a coherence signal.
+    const bundleGroups = new Map<string, number>();
+    let untitledIdx = 0;
+    for (const task of allTasks) {
+      if (task.archived || task.assigned_to !== agent || task.status !== 'in_progress') continue;
+      let key: string;
+      if (task.bundle_id) {
+        key = task.bundle_id;
+      } else {
+        const prefix = logicalPrefix(task.title ?? '');
+        key = prefix.length > 0 ? prefix : `__untitled_${untitledIdx++}`;
+      }
+      bundleGroups.set(key, (bundleGroups.get(key) ?? 0) + 1);
+    }
+    const inProgressBundleMax = bundleGroups.size === 0 ? 0 : Math.max(...bundleGroups.values());
+
     const denom = completed + pending;
     const assignee: AssigneeMetrics = {
       completed,
       pending,
       in_progress: inProgress,
       completion_ratio: denom === 0 ? null : completed / denom,
+      in_progress_bundle_max: inProgressBundleMax,
     };
     const authoring: AuthoringMetrics = {
       authored_total: authoredTotal,
