@@ -32,8 +32,10 @@ if [ -z "$REMOTE_SHA" ]; then
   exit 0
 fi
 
-if [ "$BUILD_SHA" = "$REMOTE_SHA" ]; then
-  echo "[cortextos-src-watch] dist up-to-date (SHA: ${REMOTE_SHA:0:8})"
+# Up-to-date if: BUILD_SHA equals REMOTE_SHA, OR origin/main is already an
+# ancestor of BUILD_SHA (local HEAD is a merge commit that includes origin/main).
+if [ -n "$BUILD_SHA" ] && git merge-base --is-ancestor "$REMOTE_SHA" "$BUILD_SHA" 2>/dev/null; then
+  echo "[cortextos-src-watch] dist up-to-date (origin/main ${REMOTE_SHA:0:8} ⊆ build ${BUILD_SHA:0:8})"
   exit 0
 fi
 
