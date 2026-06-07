@@ -30,6 +30,12 @@ export interface AssigneeMetrics {
   in_progress_effective: number;
   /** completed / (completed + pending), or null when both are 0 */
   completion_ratio: number | null;
+  /**
+   * Size of the largest title-prefix or bundle_id group among in-progress tasks.
+   * Used by detectAnomalies to suppress wip_cap_breach when the excess is a
+   * coherent bundle (healthy batching) rather than scattered context-switching.
+   */
+  in_progress_bundle_max: number;
 }
 
 export interface AuthoringMetrics {
@@ -233,6 +239,7 @@ interface TaskRecord {
   created_at?: string;
   archived?: boolean;
   title?: string;
+  bundle_id?: string;
 }
 
 /**
@@ -293,6 +300,17 @@ function countInboxRequests(eventFiles: string[]): number {
     } catch { /* skip */ }
   }
   return count;
+}
+
+/**
+ * Derive a grouping key for a task title. Returns the first `[TAG]` bracket
+ * token if present (e.g. "[T-A] foo" → "t-a"), otherwise the first two
+ * whitespace-delimited words lowercased. Used for bundle-context detection.
+ */
+function logicalPrefix(title: string): string {
+  const bracketMatch = title.match(/^\[([^\]]+)\]/);
+  if (bracketMatch) return bracketMatch[1].toLowerCase();
+  return title.trim().toLowerCase().split(/\s+/).slice(0, 2).join(' ');
 }
 
 /**
@@ -722,6 +740,25 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       } catch { /* stale by default */ }
     }
 
+    // Compute bundle-group max for WIP-cap suppression.
+    // Group in-progress tasks by bundle_id if present, else by logicalPrefix(title).
+    // Tasks with no title AND no bundle_id get a unique key so they never
+    // inflate a bundle group — absence of a title is not a coherence signal.
+    const bundleGroups = new Map<string, number>();
+    let untitledIdx = 0;
+    for (const task of allTasks) {
+      if (task.archived || task.assigned_to !== agent || task.status !== 'in_progress') continue;
+      let key: string;
+      if (task.bundle_id) {
+        key = task.bundle_id;
+      } else {
+        const prefix = logicalPrefix(task.title ?? '');
+        key = prefix.length > 0 ? prefix : `__untitled_${untitledIdx++}`;
+      }
+      bundleGroups.set(key, (bundleGroups.get(key) ?? 0) + 1);
+    }
+    const inProgressBundleMax = bundleGroups.size === 0 ? 0 : Math.max(...bundleGroups.values());
+
     const denom = completed + pending;
     const assignee: AssigneeMetrics = {
       completed,
@@ -729,6 +766,7 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       in_progress: inProgress,
       in_progress_effective: inProgressBundles.size + inProgressStandalone,
       completion_ratio: denom === 0 ? null : completed / denom,
+      in_progress_bundle_max: inProgressBundleMax,
     };
     const authoring: AuthoringMetrics = {
       authored_total: authoredTotal,
