@@ -286,6 +286,14 @@ export function updateTask(
     assignee = task.assigned_to;
     task.status = status;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    // Re-opening a completed task must clear completed_at so the task does not
+    // appear simultaneously in_progress and done. Without this, the read-modify-
+    // write in completeTask followed by an updateTask("in_progress") revert leaves
+    // completed_at set with status≠completed — the inconsistency that caused the
+    // IMPROVE-frontend-dev-01 audit finding (2026-06-15).
+    if (status !== 'completed') {
+      task.completed_at = null;
+    }
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);

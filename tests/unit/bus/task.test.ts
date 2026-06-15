@@ -100,6 +100,20 @@ describe('Task Management', () => {
       const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
       expect(content.status).toBe('in_progress');
     });
+
+    it('REGRESSION: reopening a completed task clears completed_at (IMPROVE-frontend-dev-01)', () => {
+      // Sequence that caused the audit finding: completeTask() → updateTask(in_progress)
+      // left completed_at set with status=in_progress — inconsistent state.
+      const taskId = createTask(paths, 'paul', 'acme', 'Reopen test task');
+      completeTask(paths, taskId, 'done');
+      const afterComplete = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(afterComplete.completed_at).toBeTruthy();
+
+      updateTask(paths, taskId, 'in_progress');
+      const afterReopen = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(afterReopen.status).toBe('in_progress');
+      expect(afterReopen.completed_at).toBeNull();
+    });
   });
 
   describe('completeTask', () => {
