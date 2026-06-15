@@ -154,6 +154,48 @@ describe('Task Management', () => {
     });
   });
 
+  describe('completeTask — double-close guard (IMPROVE-frontend-dev-01)', () => {
+    it('rejects re-closing with a shorter result, preserving the original VERIFIED result', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Guard test task');
+      completeTask(paths, taskId, 'VERIFIED: fix shipped at abc123, 0 console errors, prod URL confirmed');
+      // Simulate the post-merge auto-close overwrite with a generic shorter note
+      expect(() =>
+        completeTask(paths, taskId, 'Auto-closed via PR #99 merge')
+      ).toThrow(/already completed with a longer result/);
+      // Original result must be untouched
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.result).toContain('VERIFIED');
+    });
+
+    it('allows re-closing with a richer (longer) result without --force', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Richer result task');
+      completeTask(paths, taskId, 'VERIFIED: initial close');
+      // A richer follow-up result should succeed without force
+      expect(() =>
+        completeTask(paths, taskId, 'VERIFIED: initial close — addendum: prod screenshot confirmed, Greptile 5/5, 0 errors')
+      ).not.toThrow();
+    });
+
+    it('allows re-closing with --force even when incoming result is shorter', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Force override task');
+      completeTask(paths, taskId, 'VERIFIED: detailed result with lots of context');
+      expect(() =>
+        completeTask(paths, taskId, 'Updated: superseded by PR #100', { force: true })
+      ).not.toThrow();
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.result).toBe('Updated: superseded by PR #100');
+    });
+
+    it('allows first-time completion on an already-completed task with no prior result', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'No-result task');
+      completeTask(paths, taskId); // complete with no result
+      // Re-closing with an actual result should succeed (no prior result to protect)
+      expect(() =>
+        completeTask(paths, taskId, 'VERIFIED: result added on re-close')
+      ).not.toThrow();
+    });
+  });
+
   describe('listTasks', () => {
     it('returns all non-archived tasks', () => {
       createTask(paths, 'paul', 'acme', 'Task 1');
