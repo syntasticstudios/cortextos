@@ -331,11 +331,16 @@ function detectAnomalies(role: RoleConfig, metrics: Omit<RoleMetrics, 'anomalies
         && metrics.assignee.completion_ratio < t.assignee_completion_ratio_min) {
       out.push('assignee_low_completion_ratio');
     }
-    // Compare against the bundle-collapsed count: a 7-task `[OVERNIGHT-CRON-HEALTH ...]`
-    // cluster is one coordinated effort, not seven independent commitments. Raw
-    // `in_progress` stays in the report for transparency.
-    if (typeof t.wip_cap_max === 'number' && metrics.assignee.in_progress_effective > t.wip_cap_max) {
-      out.push('assignee_wip_cap_breach');
+    if (typeof t.wip_cap_max === 'number' && metrics.assignee.in_progress > t.wip_cap_max) {
+      // Bundle-context suppression: if the excess above wip_cap is entirely
+      // explained by one coherent bundle (≥3 tasks sharing a prefix/bundle_id),
+      // the agent is doing healthy batching — not scattered context-switching.
+      const bundleMax = metrics.assignee.in_progress_bundle_max;
+      const nonBundleCount = metrics.assignee.in_progress - bundleMax;
+      const isBundling = bundleMax >= 3 && nonBundleCount < t.wip_cap_max;
+      if (!isBundling) {
+        out.push('assignee_wip_cap_breach');
+      }
     }
   }
   if (wantsAuthoring) {
