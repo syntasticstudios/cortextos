@@ -15,6 +15,14 @@ import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHi
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
+import { execFileSync } from 'child_process';
+import {
+  listAgentPidFiles,
+  classifyOrphan,
+  clearAgentPidFile,
+  type OrphanProbe,
+  type LiveProcessInfo,
+} from './agent-pid-file.js';
 
 type LogFn = (msg: string) => void;
 
@@ -39,6 +47,94 @@ export class AgentManager {
     this.ctxRoot = ctxRoot;
     this.frameworkRoot = frameworkRoot;
     this.org = org;
+  }
+
+  /**
+   * SYS-DAEMON-RESILIENCE-01 Fix 2: reconcile orphaned agent PTYs left by a
+   * previous daemon CRASH-exit (which skips stopAll, so SIGHUP-handling `claude`
+   * children orphan-survive, reparented to PID 1). Runs BEFORE discoverAndStart
+   * so a survivor is reaped first and then cold-started cleanly with --continue
+   * (context restored from the on-disk JSONL), rather than leaving an
+   * unreachable orphan with no crons + a duplicate fresh spawn.
+   *
+   * SAFETY — only ever SIGTERMs a CONFIRMED own live agent PTY:
+   *  - path-scoped: reads only THIS instance's own ctxRoot state pid-files, so a
+   *    foreign instance's PTYs are structurally invisible (+ instanceId re-checked).
+   *  - never a daemon PID (own daemon.pid + this process excluded).
+   *  - 3-part PID-REUSE guard (classifyOrphan): kill-0 AND ps-command matches the
+   *    agent pattern AND ps start-time ~= the recorded spawnedAt. Any miss =>
+   *    stale-unlink (NEVER kill) — guards a recycled PID that is an unrelated
+   *    process OR another/other-instance agent that took over the dead PID.
+   *
+   * Pure decision logic is in classifyOrphan (unit-tested); this method only
+   * supplies the real probes + performs the side effects (SIGTERM / unlink).
+   */
+  reconcileOrphans(): { reaped: string[]; unlinked: string[] } {
+    const reaped: string[] = [];
+    const unlinked: string[] = [];
+    const pidFiles = listAgentPidFiles(this.ctxRoot);
+    if (pidFiles.length === 0) return { reaped, unlinked };
+
+    const daemonPids = this.collectDaemonPids();
+    const probe: OrphanProbe = {
+      isAlive: (pid: number): boolean => {
+        try { process.kill(pid, 0); return true; } catch { return false; }
+      },
+      getLiveProcess: (pid: number): LiveProcessInfo | null => this.psProcessInfo(pid),
+    };
+
+    for (const { record } of pidFiles) {
+      const verdict = classifyOrphan(record, this.instanceId, daemonPids, probe);
+      if (verdict === 'reap') {
+        try {
+          process.kill(record.pid, 'SIGTERM');
+          reaped.push(record.agent);
+          console.log(`[agent-manager] reconcile: reaped orphaned PTY for "${record.agent}" (pid ${record.pid}) — will cold-start with --continue.`);
+        } catch (err) {
+          console.error(`[agent-manager] reconcile: SIGTERM failed for "${record.agent}" pid ${record.pid}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        clearAgentPidFile(this.ctxRoot, record.agent);
+      } else if (verdict === 'stale-unlink') {
+        clearAgentPidFile(this.ctxRoot, record.agent);
+        unlinked.push(record.agent);
+      }
+      // foreign-skip: leave another instance's file untouched (shouldn't occur).
+    }
+    if (reaped.length || unlinked.length) {
+      console.log(`[agent-manager] reconcile complete: reaped=[${reaped.join(',')}] unlinked-stale=[${unlinked.join(',')}]`);
+    }
+    return { reaped, unlinked };
+  }
+
+  /** PIDs that must NEVER be reaped (this daemon + its recorded daemon.pid). */
+  private collectDaemonPids(): number[] {
+    const pids = new Set<number>([process.pid]);
+    try {
+      const p = join(this.ctxRoot, 'daemon.pid');
+      if (existsSync(p)) {
+        const n = parseInt(readFileSync(p, 'utf-8').trim(), 10);
+        if (Number.isFinite(n)) pids.add(n);
+      }
+    } catch { /* best effort */ }
+    return [...pids];
+  }
+
+  /** OS identity of a live PID via `ps` (macOS has no /proc). Returns the full
+   *  command + actual start-time (epoch ms) for the 3-part PID-reuse guard. */
+  private psProcessInfo(pid: number): LiveProcessInfo | null {
+    try {
+      const out = execFileSync('ps', ['-p', String(pid), '-o', 'lstart=,command='], { encoding: 'utf-8' }).trim();
+      if (!out) return null;
+      // `lstart` is a fixed 5-token form: "Wed Jun 18 21:33:01 2026", then command.
+      const tokens = out.split(/\s+/);
+      if (tokens.length < 6) return null;
+      const startedAtMs = Date.parse(tokens.slice(0, 5).join(' '));
+      if (!Number.isFinite(startedAtMs)) return null;
+      const command = tokens.slice(5).join(' ');
+      return { command, startedAtMs };
+    } catch {
+      return null; // ps failed / process gone between kill-0 and ps
+    }
   }
 
   /**

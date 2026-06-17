@@ -13,6 +13,7 @@ import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 import { readCrashCount, incrementCrashCount } from './crash-counter.js';
 import { ensureWorktree } from './worktree-manager.js';
+import { writeAgentPidFile, clearAgentPidFile } from './agent-pid-file.js';
 
 type LogFn = (msg: string) => void;
 
@@ -213,6 +214,21 @@ export class AgentProcess {
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
 
+      // SYS-DAEMON-RESILIENCE-01 Fix 2: persist the PTY PID synchronously the
+      // instant it is available, so a later daemon CRASH-exit (which skips
+      // stopAll) leaves a restart-durable record reconcileOrphans() can find +
+      // reap. instanceId is recorded for the instance-membership guard; spawnedAt
+      // (the process start time) backs the 3-part PID-reuse guard. Cleared only
+      // on a CLEAN stop() — a crash/halt deliberately leaves it for reconcile.
+      const livePid = this.pty.getPid();
+      if (typeof livePid === 'number') {
+        try {
+          writeAgentPidFile(this.env.ctxRoot, this.env.instanceId, this.name, livePid, this.sessionStart.toISOString());
+        } catch (err) {
+          this.log(`Failed to write pty.pid (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
       // Issue #392: codex-app-server does not reliably execute the inline
       // "Send a Telegram message saying you are back online" instruction the
       // way claude-code does, so fire the back-online ping directly from the
@@ -314,6 +330,11 @@ export class AgentProcess {
     // cleared by handleExit when the intentional exit fires (or by start()
     // when a new lifecycle begins). See BUG-040 fix in handleExit().
     this.status = 'stopped';
+    // SYS-DAEMON-RESILIENCE-01 Fix 2: clean stop -> remove the pid-file so a
+    // subsequent boot's reconcile does not treat this (intentionally stopped)
+    // agent as a survived orphan. A crash/halt skips this path, leaving the
+    // pid-file for reconcile to liveness-check + reap.
+    clearAgentPidFile(this.env.ctxRoot, this.name);
     this.notifyStatusChange();
     this.log('Stopped');
   }
