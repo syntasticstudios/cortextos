@@ -64,7 +64,11 @@ export class AgentProcess {
   private resolveExit: (() => void) | null = null;
   private dedup: MessageDedup;
   private log: LogFn;
-  private onStatusChange: ((status: AgentStatus) => void) | null = null;
+  // SYS-DAEMON-RESILIENCE-01 Fix 3: multiple subscribers (was a single
+  // overwriting handler). The daemon registers a registry-cleanup handler for
+  // terminal 'halted' AND, when Telegram is configured, a notification handler —
+  // a single slot let the second registration silently clobber the first.
+  private onStatusChangeHandlers: Array<(status: AgentStatus) => void> = [];
   // Issue #330: held here so CodexAppServerPTY can be re-wired across session refresh
   // (each start() recreates the PTY, but the Telegram handle persists).
   private telegramApi: TelegramAPI | null = null;
@@ -407,7 +411,7 @@ export class AgentProcess {
    * Register a status change handler.
    */
   onStatusChanged(handler: (status: AgentStatus) => void): void {
-    this.onStatusChange = handler;
+    this.onStatusChangeHandlers.push(handler);
   }
 
   /**
@@ -1054,8 +1058,12 @@ export class AgentProcess {
   }
 
   private notifyStatusChange(): void {
-    if (this.onStatusChange) {
-      this.onStatusChange(this.getStatus());
+    const status = this.getStatus();
+    for (const handler of this.onStatusChangeHandlers) {
+      // One bad subscriber must not break the others (or the status path).
+      try { handler(status); } catch (err) {
+        this.log(`status-change handler error: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 }

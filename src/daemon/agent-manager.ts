@@ -315,6 +315,26 @@ export class AgentManager {
     }
 
     const agentProcess = new AgentProcess(name, env, config, log);
+
+    // SYS-DAEMON-RESILIENCE-01 Fix 3: clean the registry corpse on terminal halt.
+    // When an agent exceeds its crash budget it reaches 'halted' and will NOT
+    // self-restart. If its registry entry lingers, a later `start`/`restart`
+    // dedups against the corpse ("already in registry") and the agent can never
+    // be revived without a full daemon restart. On 'halted' (terminal only —
+    // NOT transient 'crashed', which schedules its own restart), remove the
+    // entry + its cron scheduler so a subsequent start cold-starts cleanly.
+    // The identity guard ensures we only reap THIS process's entry, never a
+    // freshly-restarted replacement that reused the name.
+    agentProcess.onStatusChanged((status) => {
+      if (status.status !== 'halted') return;
+      if (this.agents.get(name)?.process !== agentProcess) return;
+      console.error(
+        `[agent-manager] "${name}" HALTED (terminal, crash-budget exhausted) — removing its registry entry + cron scheduler so a future start is not deduped against a dead corpse.`,
+      );
+      const sched = this.cronSchedulers.get(name);
+      if (sched) { sched.stop(); this.cronSchedulers.delete(name); }
+      this.agents.delete(name);
+    });
     // Issue #330: pass the Telegram handle into AgentProcess so CodexAppServerPTY
     // can emit sendChatAction directly from the JSONL stream. Has no effect for
     // claude-code / hermes runtimes — those still use fast-checker.

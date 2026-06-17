@@ -13,28 +13,39 @@ import { tmpdir } from 'os';
 
 // Names whose mocked AgentProcess.start() will reject (set per-test).
 const FAIL_START = new Set<string>();
+// Live mock AgentProcess instances, by agent name (latest wins) — lets a test
+// drive status transitions (e.g. emit 'halted') for Fix 3.
+const INSTANCES = new Map<string, MockAgentProcess>();
 
-vi.mock('../../../src/daemon/agent-process.js', () => ({
-  AgentProcess: class {
-    name: string;
-    // expose config so AgentManager.startAgentCronScheduler can read process['config']
-    config: Record<string, unknown>;
-    constructor(name: string, _env: unknown, config: Record<string, unknown>) {
-      this.name = name;
-      this.config = config ?? {};
+class MockAgentProcess {
+  name: string;
+  // expose config so AgentManager.startAgentCronScheduler can read process['config']
+  config: Record<string, unknown>;
+  private _status = 'running';
+  private _handlers: Array<(s: { name: string; status: string }) => void> = [];
+  constructor(name: string, _env: unknown, config: Record<string, unknown>) {
+    this.name = name;
+    this.config = config ?? {};
+    INSTANCES.set(name, this);
+  }
+  async start() {
+    if (FAIL_START.has(this.name)) {
+      throw new Error(`simulated start() failure for ${this.name}`);
     }
-    async start() {
-      if (FAIL_START.has(this.name)) {
-        throw new Error(`simulated start() failure for ${this.name}`);
-      }
-    }
-    async stop() { /* no-op */ }
-    getStatus() { return { name: this.name, status: 'running' }; }
-    onExit() { /* no-op */ }
-    onStatusChanged() { /* no-op */ }
-    setTelegramHandle() { /* no-op */ }
-  },
-}));
+  }
+  async stop() { /* no-op */ }
+  getStatus() { return { name: this.name, status: this._status }; }
+  onExit() { /* no-op */ }
+  onStatusChanged(h: (s: { name: string; status: string }) => void) { this._handlers.push(h); }
+  setTelegramHandle() { /* no-op */ }
+  // test helper: emit a status transition to all subscribers
+  __emit(status: string) {
+    this._status = status;
+    for (const h of this._handlers) h({ name: this.name, status });
+  }
+}
+
+vi.mock('../../../src/daemon/agent-process.js', () => ({ AgentProcess: MockAgentProcess }));
 
 vi.mock('../../../src/daemon/fast-checker.js', () => ({
   FastChecker: class { start() {} stop() {} wake() {} },
@@ -52,6 +63,7 @@ describe('SYS-DAEMON-RESILIENCE-01 Fix 1: assert-outcome boot (no swallow)', () 
 
   beforeEach(() => {
     FAIL_START.clear();
+    INSTANCES.clear();
     testDir = mkdtempSync(join(tmpdir(), 'cortextos-resilience-'));
     ctxRoot = join(testDir, 'instance');
     frameworkRoot = join(testDir, 'framework');
@@ -107,5 +119,36 @@ describe('SYS-DAEMON-RESILIENCE-01 Fix 1: assert-outcome boot (no swallow)', () 
     expect(am.getCronScheduler('failstart')).toBeDefined();
     const logged = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
     expect(logged).not.toContain('BOOT-ASSERT FAIL');
+  });
+
+  // ---- Fix 3: terminal-halt registry cleanup ----
+
+  it('removes a HALTED agent from the registry + scheduler so a later start is not deduped', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    await am.discoverAndStart();
+    expect(am.getAgentNames()).toContain('goodagent');
+    expect(am.getCronScheduler('goodagent')).toBeDefined();
+    // dedup BEFORE halt: a start would be deduped (entry present)
+    expect(am.inspectAgentOp('start', 'goodagent')).toMatchObject({ ok: false, code: 'DEDUPED' });
+
+    // drive the agent to the terminal 'halted' state
+    INSTANCES.get('goodagent')!.__emit('halted');
+
+    // corpse + scheduler removed
+    expect(am.getAgentNames()).not.toContain('goodagent');
+    expect(am.getCronScheduler('goodagent')).toBeUndefined();
+    // a subsequent start is NO LONGER deduped against the corpse
+    expect(am.inspectAgentOp('start', 'goodagent')).toEqual({ ok: true });
+  });
+
+  it('does NOT remove on transient crashed (self-restart pending)', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    await am.discoverAndStart();
+
+    INSTANCES.get('goodagent')!.__emit('crashed');
+
+    // still registered — crashed is transient; handleExit schedules a restart
+    expect(am.getAgentNames()).toContain('goodagent');
+    expect(am.getCronScheduler('goodagent')).toBeDefined();
   });
 });
