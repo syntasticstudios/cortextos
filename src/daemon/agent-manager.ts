@@ -71,9 +71,63 @@ export class AgentManager {
     // external IPC start-agent calls to race with discoverAndStart and trigger
     // the BUG-011 pendingRestarts cascade. Each agent's startup_delay now runs
     // concurrently instead of blocking the whole queue.
-    await Promise.allSettled(
+    const results = await Promise.allSettled(
       toStart.map(({ name, dir, config, org }) => this.startAgent(name, dir, config, org)),
     );
+
+    // SYS-DAEMON-RESILIENCE-01 Fix 1: do-NOT-swallow + assert-outcome.
+    // `startAgent` registers the agent (this.agents.set) and only AFTER an
+    // awaited `agentProcess.start()` wires the cron scheduler. A rejection
+    // between those points used to be discarded by `Promise.allSettled`,
+    // leaving an agent with a live session but NO cron scheduler — a silent
+    // partial-start that masked a failed mechanism behind a "booted fine"
+    // surface. Now: log every rejected start (no swallow), then ASSERT that
+    // every enabled agent ended with the cron scheduler it requires.
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') {
+        console.error(
+          `[agent-manager] startAgent REJECTED for "${toStart[i].name}": ${r.reason instanceof Error ? r.reason.stack ?? r.reason.message : String(r.reason)}`,
+        );
+      }
+    });
+    this.assertBootOutcomes(toStart.map(({ name }) => name));
+  }
+
+  /**
+   * SYS-DAEMON-RESILIENCE-01 Fix 1: post-boot outcome assertion.
+   *
+   * For every agent that SHOULD have started, verify it ended in the required
+   * state — registered AND (for non-Hermes runtimes) wired to a cron scheduler.
+   * A registered-but-scheduler-less agent is the partial-start failure mode:
+   * recover it by lazy-wiring the scheduler (same path `reloadCrons` uses for
+   * the start-window gap), and log loudly if recovery still fails. This turns a
+   * silently-swallowed partial start into an observable, self-healed outcome.
+   */
+  private assertBootOutcomes(names: string[]): void {
+    for (const name of names) {
+      const entry = this.agents.get(name);
+      if (!entry) {
+        console.error(
+          `[agent-manager] BOOT-ASSERT FAIL: "${name}" was enabled but is NOT registered (start failed before registry insert) — agent has no session and no crons.`,
+        );
+        continue;
+      }
+      // Hermes manages its own crons natively — no daemon scheduler expected.
+      if (entry.process['config']?.runtime === 'hermes') continue;
+      if (this.cronSchedulers.has(name)) continue;
+
+      console.error(
+        `[agent-manager] BOOT-ASSERT: "${name}" registered but has NO cron scheduler (partial start) — recovering via lazy-wire.`,
+      );
+      this.startAgentCronScheduler(name);
+      if (!this.cronSchedulers.has(name)) {
+        console.error(
+          `[agent-manager] BOOT-ASSERT FAIL: "${name}" still has no cron scheduler after recovery — crons will not fire for this agent.`,
+        );
+      } else {
+        console.log(`[agent-manager] BOOT-ASSERT: "${name}" cron scheduler recovered.`);
+      }
+    }
   }
 
   /**
