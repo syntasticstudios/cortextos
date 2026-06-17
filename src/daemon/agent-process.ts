@@ -14,6 +14,7 @@ import { resolvePaths } from '../utils/paths.js';
 import { readCrashCount, incrementCrashCount } from './crash-counter.js';
 import { ensureWorktree } from './worktree-manager.js';
 import { writeAgentPidFile, clearAgentPidFile } from './agent-pid-file.js';
+import { repairConversationDir } from './jsonl-repair.js';
 
 type LogFn = (msg: string) => void;
 
@@ -140,6 +141,25 @@ export class AgentProcess {
 
     // Determine start mode
     const mode = this.shouldContinue() ? 'continue' : 'fresh';
+
+    // SYS-DAEMON-RESILIENCE-01 Fix 2 (mitigation ii): before a --continue resume,
+    // repair any truncated trailing JSONL line (e.g. left by a mid-write SIGTERM
+    // when reaping an orphan). Deterministic + in our control rather than relying
+    // on undocumented `claude --continue` partial-line tolerance. Claude runtime
+    // only — Hermes/codex track continuity via their own state files.
+    if (mode === 'continue' && this.config.runtime !== 'hermes' && this.config.runtime !== 'codex-app-server') {
+      const launchDir = this.config.working_directory || this.env.agentDir;
+      if (launchDir) {
+        const convDir = join(homedir(), '.claude', 'projects', launchDir.split(sep).join('-'));
+        try {
+          const changed = repairConversationDir(convDir);
+          if (changed > 0) this.log(`Repaired ${changed} JSONL file(s) with a truncated trailing line before --continue`);
+        } catch (err) {
+          this.log(`JSONL repair skipped (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+
     const prompt = mode === 'fresh'
       ? this.buildStartupPrompt()
       : this.buildContinuePrompt();
