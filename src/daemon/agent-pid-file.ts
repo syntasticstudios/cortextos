@@ -94,6 +94,32 @@ export function listAgentPidFiles(ctxRoot: string): Array<{ path: string; record
   return out;
 }
 
+/**
+ * Parse a `ps -o etime=` elapsed-time string (LOCALE-INDEPENDENT) to milliseconds.
+ * Format: `[[dd-]hh:]mm:ss` — e.g. "05", "01:23", "12:34:56", "3-01:23:45".
+ * Returns null if unparseable.
+ */
+export function parseEtimeMs(etime: string): number | null {
+  const s = etime.trim();
+  if (!s) return null;
+  let days = 0;
+  let rest = s;
+  const dash = rest.indexOf('-');
+  if (dash !== -1) {
+    days = Number(rest.slice(0, dash));
+    rest = rest.slice(dash + 1);
+  }
+  const parts = rest.split(':').map((p) => Number(p));
+  if (parts.some((n) => !Number.isFinite(n))) return null;
+  let h = 0, m = 0, sec = 0;
+  if (parts.length === 3) [h, m, sec] = parts;
+  else if (parts.length === 2) [m, sec] = parts;
+  else if (parts.length === 1) [sec] = parts;
+  else return null;
+  if (!Number.isFinite(days)) return null;
+  return ((days * 86400) + (h * 3600) + (m * 60) + sec) * 1000;
+}
+
 /** What the OS reports for a live PID — used to corroborate identity before reap. */
 export interface LiveProcessInfo {
   /** Full command/argv string (`ps -o command=`) — comm/agent-pattern match. */

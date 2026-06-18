@@ -9,6 +9,7 @@ import {
   listAgentPidFiles,
   agentPidFilePath,
   classifyOrphan,
+  parseEtimeMs,
   type AgentPidRecord,
   type OrphanProbe,
   type LiveProcessInfo,
@@ -49,6 +50,19 @@ describe('agent-pid-file persistence', () => {
     mkdirSync(join(ctxRoot, 'state', 'dave'), { recursive: true });
     writeFileSync(agentPidFilePath(ctxRoot, 'dave'), '{ not json');
     expect(readAgentPidFile(agentPidFilePath(ctxRoot, 'dave'))).toBeNull();
+  });
+});
+
+describe('parseEtimeMs (locale-independent ps elapsed-time)', () => {
+  it('parses ss / mm:ss / hh:mm:ss / dd-hh:mm:ss', () => {
+    expect(parseEtimeMs('05')).toBe(5_000);
+    expect(parseEtimeMs('01:23')).toBe(83_000);
+    expect(parseEtimeMs('12:34:56')).toBe(((12 * 3600) + (34 * 60) + 56) * 1000);
+    expect(parseEtimeMs('3-01:23:45')).toBe(((3 * 86400) + (1 * 3600) + (23 * 60) + 45) * 1000);
+  });
+  it('returns null on garbage', () => {
+    expect(parseEtimeMs('')).toBeNull();
+    expect(parseEtimeMs('abc')).toBeNull();
   });
 });
 

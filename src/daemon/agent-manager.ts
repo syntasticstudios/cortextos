@@ -20,6 +20,7 @@ import {
   listAgentPidFiles,
   classifyOrphan,
   clearAgentPidFile,
+  parseEtimeMs,
   type OrphanProbe,
   type LiveProcessInfo,
 } from './agent-pid-file.js';
@@ -120,18 +121,24 @@ export class AgentManager {
   }
 
   /** OS identity of a live PID via `ps` (macOS has no /proc). Returns the full
-   *  command + actual start-time (epoch ms) for the 3-part PID-reuse guard. */
+   *  command + actual start-time (epoch ms) for the 3-part PID-reuse guard.
+   *
+   *  Uses `etime` (elapsed, LOCALE-INDEPENDENT) rather than `lstart` — `lstart`
+   *  renders in the system locale (e.g. German "Do. 18 Juni …") which Date.parse
+   *  handles only by luck. startedAtMs = now - elapsed, which for a genuine orphan
+   *  equals its recorded spawnedAt, and for a recycled (later-started) PID does
+   *  not — exactly the discriminator the guard needs. */
   private psProcessInfo(pid: number): LiveProcessInfo | null {
     try {
-      const out = execFileSync('ps', ['-p', String(pid), '-o', 'lstart=,command='], { encoding: 'utf-8' }).trim();
+      const out = execFileSync('ps', ['-p', String(pid), '-o', 'etime=,command='], { encoding: 'utf-8' }).trim();
       if (!out) return null;
-      // `lstart` is a fixed 5-token form: "Wed Jun 18 21:33:01 2026", then command.
-      const tokens = out.split(/\s+/);
-      if (tokens.length < 6) return null;
-      const startedAtMs = Date.parse(tokens.slice(0, 5).join(' '));
-      if (!Number.isFinite(startedAtMs)) return null;
-      const command = tokens.slice(5).join(' ');
-      return { command, startedAtMs };
+      const firstSpace = out.indexOf(' ');
+      if (firstSpace === -1) return null;
+      const etime = out.slice(0, firstSpace).trim();
+      const command = out.slice(firstSpace + 1).trim();
+      const elapsedMs = parseEtimeMs(etime);
+      if (elapsedMs === null) return null;
+      return { command, startedAtMs: Date.now() - elapsedMs };
     } catch {
       return null; // ps failed / process gone between kill-0 and ps
     }
