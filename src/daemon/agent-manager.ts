@@ -88,6 +88,14 @@ export class AgentManager {
       const verdict = classifyOrphan(record, this.instanceId, daemonPids, probe);
       if (verdict === 'reap') {
         try {
+          // SIGTERM (not SIGKILL): claude-code exits fast + flushes its JSONL on
+          // SIGTERM. We do NOT waitpid/drain here before discoverAndStart re-spawns
+          // this agent — in the rare case a PTY lingers >tolerance after SIGTERM,
+          // the fresh --continue spawn could briefly overlap the dying orphan on
+          // the same conversation JSONL. Acceptable: claude exits fast on SIGTERM
+          // and discoverAndStart's own per-agent setup latency covers the gap. If
+          // this ever proves racy, add a bounded drain (poll kill-0 on `reaped`
+          // PIDs, ~few s) before returning. (review note: cortextos-improver 2026-06-18)
           process.kill(record.pid, 'SIGTERM');
           reaped.push(record.agent);
           console.log(`[agent-manager] reconcile: reaped orphaned PTY for "${record.agent}" (pid ${record.pid}) — will cold-start with --continue.`);
