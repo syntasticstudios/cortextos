@@ -794,4 +794,87 @@ describe('CronScheduler', () => {
     expect(names).toContain('b');
     expect(names).not.toContain('c'); // disabled, not scheduled
   });
+
+  // -------------------------------------------------------------------------
+  // SYS-CRON-FIRING-FLAG: onFire timeout un-wedges sc.firing
+  // -------------------------------------------------------------------------
+
+  it('clears sc.firing and reschedules after onFire times out (wedged session)', async () => {
+    // Use a very short timeout so the test doesn't wait 45 s.
+    process.env.CRON_ONFIRE_TIMEOUT_MS = '100';
+
+    mockReadCrons.mockReturnValue([makeCron({ name: 'wedge-cron', schedule: '1m' })]);
+
+    let hangResolve: (() => void) | undefined;
+    let fireCount = 0;
+
+    // onFire hangs on the first call (wedged session), succeeds on the second.
+    const onFire = vi.fn().mockImplementation(() => {
+      fireCount++;
+      if (fireCount === 1) {
+        // Return a Promise that never resolves — simulates a wedged PTY injection.
+        return new Promise<void>(resolve => { hangResolve = resolve; });
+      }
+      return Promise.resolve();
+    });
+
+    const wedgedScheduler = new CronScheduler({
+      agentName: 'test-agent',
+      onFire,
+      logger: () => {},
+    });
+    wedgedScheduler.start();
+
+    // First tick: fires the cron, onFire hangs → timeout fires after 100 ms.
+    // Allow time for: tick (30 s) + all 4 timeout attempts (4 × 100 ms) +
+    // retry delays (1 s + 4 s + 16 s) + buffer.
+    await vi.advanceTimersByTimeAsync(TICK + 4 * 100 + 21_000 + 1_000);
+
+    // Cron should have advanced to next slot (sc.firing cleared) so a second
+    // tick fires it again without hanging.
+    await vi.advanceTimersByTimeAsync(60_000 + TICK);
+
+    // The second fire must have happened (fireCount > 1 means the first timed
+    // out AND the cron was re-armed for a later slot that actually fired).
+    expect(fireCount).toBeGreaterThan(1);
+
+    wedgedScheduler.stop();
+    hangResolve?.(); // clean up the dangling Promise
+    delete process.env.CRON_ONFIRE_TIMEOUT_MS;
+  });
+
+  it('does NOT skip a non-wedged cron scheduled after a wedged one', async () => {
+    process.env.CRON_ONFIRE_TIMEOUT_MS = '100';
+
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'wedge-cron', schedule: '1m' }),
+      makeCron({ name: 'healthy-cron', schedule: '1m' }),
+    ]);
+
+    const healthyFired: string[] = [];
+    let firstCall = true;
+
+    const onFire = vi.fn().mockImplementation((cron: CronDefinition) => {
+      if (cron.name === 'wedge-cron' && firstCall) {
+        firstCall = false;
+        return new Promise<void>(() => {}); // hang
+      }
+      healthyFired.push(cron.name);
+      return Promise.resolve();
+    });
+
+    const s = new CronScheduler({ agentName: 'test-agent', onFire, logger: () => {} });
+    s.start();
+
+    // Crons become due at T=60 s (nextFireAt = now + 1m). Wedge-cron fires
+    // first (Map insertion order); its 4 timeout attempts × 100 ms + retry
+    // delays (1s + 4s + 16s) take ~21.4 s.  Loop then reaches healthy-cron.
+    // Advance past 60 s (due) + 21.4 s (wedge retries) + buffer.
+    await vi.advanceTimersByTimeAsync(60_000 + 4 * 100 + 21_000 + 1_000);
+    // healthy-cron must have fired despite wedge-cron hanging
+    expect(healthyFired).toContain('healthy-cron');
+
+    s.stop();
+    delete process.env.CRON_ONFIRE_TIMEOUT_MS;
+  });
 });
