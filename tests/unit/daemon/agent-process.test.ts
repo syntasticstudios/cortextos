@@ -79,6 +79,18 @@ vi.mock('fs', async () => {
   };
 });
 
+// SYS-1M-DETECT: the MODEL_BILLING_CONFIG escalation shells out to
+// `cortextos bus send-message platform-director ...` via execFileSync. Mock it
+// so tests never spawn a real process and can assert escalate-once behaviour.
+const mockExecFileSync = vi.fn();
+vi.mock('child_process', async () => {
+  const actual = await vi.importActual<typeof import('child_process')>('child_process');
+  return {
+    ...actual,
+    execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
+  };
+});
+
 const { AgentProcess } = await import('../../../src/daemon/agent-process.js');
 
 const mockEnv = {
@@ -100,6 +112,7 @@ beforeEach(() => {
   mockPty.isAlive.mockReturnValue(true);
   mockPty.onExit.mockClear();
   mockInjectMessage.mockClear();
+  mockExecFileSync.mockClear();
   fsMocks.existsSync.mockReset().mockReturnValue(false);
   fsMocks.readFileSync.mockReset();
   fsMocks.writeFileSync.mockReset();
@@ -449,20 +462,12 @@ describe('AgentProcess — context exhaustion auto-recovery (SYS-DAEMON-CTX-01)'
     expect(ap.getCrashCount()).toBe(0);
   });
 
-  it('detects "Extra usage is required for 1M context" billing gate', async () => {
-    const ap = new AgentProcess('alice', mockEnv, {});
-    await ap.start();
-
-    vi.spyOn(ap as any, 'tailStdoutLog').mockReturnValue(
-      'Extra usage is required for 1M context',
-    );
-    capturedOnExit!(0, 0);
-
-    expect(ap.getStatus().status).toBe('crashed');
-    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
-    expect(String(logLine)).toContain('CONTEXT_EXHAUSTION_RECOVERY');
-    expect(ap.getCrashCount()).toBe(0);
-  });
+  // NOTE: the 1M-context billing strings ("Extra usage is required for 1M
+  // context" / "Usage credits required for 1M context") are deliberately NOT
+  // tested here — they are a CONFIG class, handled by the MODEL_BILLING_CONFIG
+  // describe block below. A prior version of this test asserted the old 1M
+  // string => CONTEXT_EXHAUSTION_RECOVERY, which ENCODED the SYS-1M-DETECT bug
+  // (force-fresh on a billing gate = restart loop). See the anti-collapse test.
 
   it('detects "conversation too long" compaction failure', async () => {
     const ap = new AgentProcess('alice', mockEnv, {});

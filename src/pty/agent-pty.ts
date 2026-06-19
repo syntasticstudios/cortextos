@@ -137,6 +137,17 @@ export class AgentPTY {
     ptyEnv['CLAUDE_CODE_DISABLE_AUTOUPDATE'] = 'true';
     ptyEnv['DISABLE_AUTOUPDATER'] = 'true';
 
+    // SYS-1M-PREVENT: force the standard (non-1M) context window for an explicit
+    // non-Opus model so an explicit-model agent on a no-credit plan cannot
+    // billing-gate-halt at session start (the improver-1M restart loop, PR #62).
+    // Stops the class at source; SYS-1M-DETECT (agent-process.ts) only catches it
+    // after the fact. Set ONLY when the agent's .env (sourced above) did not
+    // already choose — opt-in/opt-out is respected. See shouldDisable1MContext
+    // for the full scoping rationale.
+    if (AgentPTY.shouldDisable1MContext(this.config, ptyEnv['CLAUDE_CODE_DISABLE_1M_CONTEXT'] !== undefined)) {
+      ptyEnv['CLAUDE_CODE_DISABLE_1M_CONTEXT'] = 'true';
+    }
+
     // CTX_ORCHESTRATOR_AGENT: read from org context.json so agents can route to orchestrator
     if (this.env.projectRoot && this.env.org) {
       try {
@@ -291,6 +302,40 @@ export class AgentPTY {
     args.push(prompt);
 
     return args;
+  }
+
+  /**
+   * SYS-1M-PREVENT — decide whether to export CLAUDE_CODE_DISABLE_1M_CONTEXT=true
+   * for this agent, forcing the standard (non-1M) context window.
+   *
+   * Claude Code defaults certain models to a 1M-token context window (in the
+   * installed build this auto-default applies to Opus, but the `<model>[1m]`
+   * suffix opts any model in). An agent spawned with an EXPLICIT config.model
+   * inherits that default; on a plan without 1M usage credits the session fails
+   * at the billing gate at SESSION START (an empty context) and Claude Code
+   * exits 0 — the daemon then halts the agent in a restart loop (the live
+   * improver-1M incident, fixed reactively via the PR #62 unpin). This guard
+   * prevents the class at source; SYS-1M-DETECT (agent-process.ts handleExit)
+   * only catches it after the fact.
+   *
+   * Scoping is least-surprise:
+   *   - explicitSetting → the agent's .env already set the var (true OR false);
+   *     respect the operator's choice, never override.
+   *   - no config.model → model:none agents inherit the harness default and
+   *     sidestep the gate entirely; leave them untouched.
+   *   - Opus models → Opus on Max/Team/Enterprise includes 1M natively (no
+   *     billing gate); disabling it would be a needless context regression.
+   *   - "[1m]" suffix → a deliberate per-model opt-in to 1M; honour it (a
+   *     no-credit halt then surfaces via SYS-1M-DETECT — the operator's choice).
+   * Everything else (explicit Sonnet/Haiku/unknown) defaults to the safe
+   * standard window.
+   */
+  static shouldDisable1MContext(config: AgentConfig, explicitSetting: boolean): boolean {
+    if (explicitSetting) return false;
+    if (!config.model) return false;
+    if (/opus/i.test(config.model)) return false;
+    if (/\[1m\]/i.test(config.model)) return false;
+    return true;
   }
 
   /**
