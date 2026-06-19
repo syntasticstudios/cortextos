@@ -122,10 +122,14 @@ async function main() {
       // window -> ESCALATE ONCE (born-wedged not silently held). Same window as re-wedge (one timer).
       appendShadowLog(root, {
         ts: new Date(nowMs).toISOString(), mode: MODE, agent: name, action: 'surface',
-        disposition: surf.escalateNow ? 'SURFACE->ESCALATE (untrusted interval persists — born-wedged not silently held)' : 'SURFACE (untrusted interval / bootstrap — NOT auto-acting)',
+        disposition: surf.escalateNow
+          ? (MODE === 'armed' ? 'SURFACE->ESCALATE (untrusted interval persists — born-wedged not silently held)'
+                              : 'SURFACE->WOULD-ESCALATE (shadow — surface is logged+monitored, no PD ping)')
+          : 'SURFACE (untrusted interval / bootstrap — NOT auto-acting)',
         reason: verdict.reason, trusted: false, nGaps: trust[name].nGaps, surfacingForMs: surf.surfacingForMs, trace: verdict.trace,
       });
-      if (surf.escalateNow && SAFE_NAME.test(name)) escalate(name, verdict, surf.surfacingForMs);
+      // PD-ping ONLY in armed: in shadow the surface is logged + independently monitored, no ping needed.
+      if (surf.escalateNow && MODE === 'armed' && SAFE_NAME.test(name)) escalate(name, verdict, surf.surfacingForMs);
       continue;
     }
 
@@ -177,9 +181,12 @@ async function main() {
       const rd = restartDisposition(stA.lastActionAt, nowMs, MODE);
       line.cooldownActive = rd.cooling;
       if (rd.escalate) {
-        line.disposition = 'ESCALATE (re-wedge within cooldown — not a transient stall)';
+        // SHADOW-PURITY: ping PD only in armed; in shadow LOG the would-escalate (no external side-effect).
+        line.disposition = MODE === 'armed'
+          ? 'ESCALATE (re-wedge within cooldown — not a transient stall)'
+          : 'WOULD-ESCALATE (shadow — re-wedge, logged not pinged)';
         appendShadowLog(root, line);
-        escalate(name, verdict, rd.sinceLast);
+        if (MODE === 'armed') escalate(name, verdict, rd.sinceLast);
         continue;
       }
       if (rd.act) {

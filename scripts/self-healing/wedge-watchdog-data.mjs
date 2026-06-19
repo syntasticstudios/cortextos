@@ -8,7 +8,15 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
 
-export const COOLDOWN_MS = 30 * 60 * 1000;          // 1 action/agent/30min
+export const COOLDOWN_MS = 30 * 60 * 1000;          // 1 action/agent/30min (re-wedge / restart cooldown)
+// Born-wedged surface-escalation window — DISTINCT from COOLDOWN_MS, and MEASURED not guessed.
+// surfaceSince CLEARS on every hb-advance, so the bound that matters is the SLOWEST agent's longest
+// healthy SINGLE-advance gap (its fastest-cron interval). Fleet measurement 2026-06-19: FE/BA
+// ~240min (4h) is the slowest; this is set comfortably above it. A healthy slow agent ticks +
+// clears surfaceSince before this; only a genuinely-never-advancing agent reaches it. (Reusing the
+// 30min COOLDOWN_MS here false-fired a born-wedged escalation on hourly user-proxy AND would have on
+// the 240min FE/BA — 2026-06-19 shadow-window finding; the two timescales are different.)
+export const SURFACE_ESCALATE_MS = 6 * 60 * 60 * 1000;   // 6h — comfortably > the 240min fleet max
 export const MIN_HB_ADVANCES = 3;                   // N: trusted interval needs >=3 observed hb-advance gaps
 export const HB_OBS_MAX = 13;                       // keep last 13 distinct hb values = 12 advance-gaps
 export const BOOTSTRAP_PRIOR_MS = 5 * 60 * 1000;    // surfacing-only prior while untrusted (NON-load-bearing: bootstrap never auto-acts)
@@ -143,14 +151,16 @@ export function applyTrust(verdict, trusted) {
  *  - NOT surfacing (recovered) -> CLEAR surfaceSince + surfaceEscalated (no stale state; a later
  *    genuine wedge re-surfaces cleanly, not pre-escalated);
  *  - first surface -> set surfaceSince = now (surfacingForMs = 0, no escalate yet);
- *  - persists past COOLDOWN_MS -> escalateNow = true ONCE; the surfaceEscalated latch prevents
- *    re-escalation (reuses COOLDOWN_MS — the SAME window/timer as the re-wedge escalation).
+ *  - persists past SURFACE_ESCALATE_MS (>> the slowest healthy cadence, NOT COOLDOWN_MS) ->
+ *    escalateNow = true ONCE; the surfaceEscalated latch prevents re-escalation. (A healthy slow
+ *    agent ticks + clears surfaceSince before this window; only a genuinely-never-advancing agent
+ *    reaches it.) The runner additionally gates the escalation PD-ping on ARMED mode.
  */
 export function tickSurfaceState(prev, isSurfacing, nowMs) {
   if (!isSurfacing) return { surfaceSince: undefined, surfaceEscalated: false, surfacingForMs: 0, escalateNow: false };
   const surfaceSince = prev.surfaceSince || nowMs;
   const surfacingForMs = nowMs - surfaceSince;
-  const escalateNow = surfacingForMs >= COOLDOWN_MS && !prev.surfaceEscalated;
+  const escalateNow = surfacingForMs >= SURFACE_ESCALATE_MS && !prev.surfaceEscalated;
   return { surfaceSince, surfaceEscalated: prev.surfaceEscalated || escalateNow, surfacingForMs, escalateNow };
 }
 
