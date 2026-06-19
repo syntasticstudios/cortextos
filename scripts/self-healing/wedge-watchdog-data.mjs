@@ -188,6 +188,31 @@ export function pidChangedReset(prevPid, curPid, hbObs) {
   return { hbObs: hbObs || [], restarted: false };
 }
 
+/**
+ * SHADOW-PURITY gate for escalate(): the PD-ping is an external side-effect, so it fires ONLY in
+ * armed mode. In shadow the runner LOGS a WOULD-ESCALATE line instead (visible, consistent with
+ * WOULD-restart). Routing escalate() through this ONE gate makes every call-site (surface, re-wedge,
+ * and any future one) shadow-safe BY CONSTRUCTION — no per-call-site gate to forget. Pure.
+ */
+export function escalationGate(mode) {
+  return mode === 'armed';
+}
+
+/**
+ * Escalation message body, parameterized by reasonType so each path describes itself correctly
+ * (a born-wedged agent may NEVER have acted, so the old hardcoded "RE-WEDGED Xm after last action"
+ * was factually false + misdirected triage). Pure + testable.
+ */
+export function escalationMessage(reasonType, name, detailMs) {
+  const mins = Math.round((detailMs || 0) / 60000);
+  if (reasonType === 're-wedge')
+    return `${name} RE-WEDGED ${mins}m after last action — NOT auto-looping (not a transient stall). Manual investigation needed.`;
+  if (reasonType === 'hold')
+    return `${name} HOLD: Gate-C refutation — no other agent advancing = possible global pause / credit exhaustion / daemon-down. NOT auto-restarting (could be fleet-wide). Check the fleet.`;
+  // born-wedged
+  return `${name} BORN-WEDGED: untrusted interval surfacing ${mins}m past the born-wedged window with no hb-advance — genuinely stuck, NOT auto-restarted (untrusted). Manual investigation needed.`;
+}
+
 // --- per-agent state readers ------------------------------------------------
 
 // ANY cron fire (not just heartbeat) — for the corroborator + Gate-C: a wedge stops ALL the

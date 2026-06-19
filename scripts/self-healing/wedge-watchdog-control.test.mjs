@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   tickSurfaceState, restartDisposition, pidChangedReset, COOLDOWN_MS, SURFACE_ESCALATE_MS,
+  escalationGate, escalationMessage,
 } from './wedge-watchdog-data.mjs';
 
 const T = 1_000_000_000_000;
@@ -109,4 +110,26 @@ test('pidChangedReset: PID unchanged -> hbObs preserved', () => {
 test('pidChangedReset: no prior pid (first sighting) -> no reset (cannot infer a restart)', () => {
   assert.equal(pidChangedReset(0, 222, [T]).restarted, false);
   assert.equal(pidChangedReset(undefined, 222, [T]).restarted, false);
+});
+
+// --- shadow-purity escalation gate (structural — single chokepoint inside escalate()) ---------
+
+test('escalationGate: shadow -> false (LOG would-escalate, NO PD ping); armed -> true (ping)', () => {
+  assert.equal(escalationGate('shadow'), false, 'shadow must be side-effect-free — no PD ping');
+  assert.equal(escalationGate('off'), false);
+  assert.equal(escalationGate('armed'), true);
+});
+
+test('escalationMessage by-reason: born-wedged path emits BORN-WEDGED (NOT the false RE-WEDGED), correct since-semantics', () => {
+  const born = escalationMessage('born-wedged', 'frontend-dev', 360 * 60_000);
+  assert.match(born, /BORN-WEDGED/);
+  assert.doesNotMatch(born, /RE-WEDGED/, 'a born-wedged agent may never have acted — must NOT say RE-WEDGED after last action');
+  assert.match(born, /surfacing 360m/, 'detail is surfacing-duration, not since-last-action');
+
+  const rewedge = escalationMessage('re-wedge', 'backend-architect', 5 * 60_000);
+  assert.match(rewedge, /RE-WEDGED 5m after last action/);
+  assert.doesNotMatch(rewedge, /BORN-WEDGED/);
+
+  const hold = escalationMessage('hold', 'platform-director', 0);
+  assert.match(hold, /Gate-C|global pause|credit/i, 'HOLD describes the possible global-pause/credit case');
 });
