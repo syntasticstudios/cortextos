@@ -137,8 +137,12 @@ export class AgentPTY {
     ptyEnv['CLAUDE_CODE_DISABLE_AUTOUPDATE'] = 'true';
     ptyEnv['DISABLE_AUTOUPDATER'] = 'true';
 
-    // SYS-1M-PREVENT (BEST-EFFORT defense-in-depth — NOT the load-bearing guard;
-    // SYS-1M-DETECT in agent-process.ts is). For an explicit non-Opus model with
+    // ┌─ SYS-1M-PREVENT: BEST-EFFORT FORWARD-GUARD; NO-OP ON CURRENT CC (v2.1.162)
+    // │  because auto-1M is OPUS-ONLY there. DETECT (agent-process.ts handleExit)
+    // └─ is the LOAD-BEARING, VERSION-AGNOSTIC guard. Do NOT treat this as active
+    //    prevention — keep this label so a future refactor knows it is a no-op now
+    //    and does not let it silently re-become a false-prevention.
+    // For an explicit non-Opus model with
     // no .env choice already made, default CLAUDE_CODE_DISABLE_1M_CONTEXT=true to
     // force the standard window. Honoured by current Claude Code (v2.1.162 reads
     // it and disables 1M — see shouldDisable1MContext), but effectiveness against
