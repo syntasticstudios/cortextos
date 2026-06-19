@@ -532,3 +532,88 @@ describe('AgentProcess — context exhaustion auto-recovery (SYS-DAEMON-CTX-01)'
     expect(String(logLine)).toContain('] CRASH:');
   });
 });
+
+describe('AgentProcess — MODEL_BILLING_CONFIG 1M-billing partition (SYS-1M-DETECT)', () => {
+  // The load-bearing guard. A 1M-context billing/config error at session start
+  // (exit 0, empty context) must HALT-and-escalate, NEVER force-fresh — a
+  // force-fresh relaunches the SAME explicit model and re-hits the SAME gate
+  // (the restart loop this exists to prevent). The partition is string-
+  // discriminated and must never collapse into the context-exhaustion path.
+
+  // restarts.log lines accumulate across start() + every handleExit; search all
+  // of them rather than trusting a fixed index.
+  const allRestartsLogText = () =>
+    fsMocks.appendFileSync.mock.calls.map((c: any[]) => String(c[1])).join('\n');
+
+  it('v2.1.111+ string "Usage credits required for 1M context" → HALT + escalate, NOT force-fresh', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    vi.spyOn(ap as any, 'tailStdoutLog').mockReturnValue('Usage credits required for 1M context');
+    capturedOnExit!(0, 0);
+
+    expect(ap.getStatus().status).toBe('halted');
+    expect(ap.getCrashCount()).toBe(0); // NOT charged against max_crashes_per_day
+    const log = allRestartsLogText();
+    expect(log).toContain('MODEL_BILLING_CONFIG');
+    expect(log).not.toContain('CONTEXT_EXHAUSTION_RECOVERY');
+    // escalated to platform-director via the bus (shelled execFileSync)
+    expect(mockExecFileSync).toHaveBeenCalledTimes(1);
+    const [cmd, cmdArgs] = mockExecFileSync.mock.calls[0];
+    expect(cmd).toBe('cortextos');
+    expect(cmdArgs).toEqual(expect.arrayContaining(['bus', 'send-message', 'platform-director']));
+  });
+
+  it('anti-collapse: legacy string "Extra usage is required for 1M context" also HALTs (never force-fresh)', async () => {
+    // Regression guard: a prior test asserted this legacy string =>
+    // CONTEXT_EXHAUSTION_RECOVERY, which ENCODED the bug (force-fresh on a
+    // billing gate). Both wordings must partition to MODEL_BILLING_CONFIG.
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    vi.spyOn(ap as any, 'tailStdoutLog').mockReturnValue('Extra usage is required for 1M context');
+    capturedOnExit!(0, 0);
+
+    expect(ap.getStatus().status).toBe('halted');
+    const log = allRestartsLogText();
+    expect(log).toContain('MODEL_BILLING_CONFIG');
+    expect(log).not.toContain('CONTEXT_EXHAUSTION_RECOVERY');
+  });
+
+  it('ANSI-wrapped billing string is still detected (TUI escape codes stripped)', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    vi.spyOn(ap as any, 'tailStdoutLog').mockReturnValue(
+      '\x1b[31mUsage credits required for 1M context\x1b[0m',
+    );
+    capturedOnExit!(0, 0);
+
+    expect(ap.getStatus().status).toBe('halted');
+    expect(allRestartsLogText()).toContain('MODEL_BILLING_CONFIG');
+  });
+
+  it('escalates ONCE per halt-episode (latch holds across repeated billing exits)', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    vi.spyOn(ap as any, 'tailStdoutLog').mockReturnValue('Usage credits required for 1M context');
+    capturedOnExit!(0, 0);
+    capturedOnExit!(0, 0); // second billing exit in the SAME episode (no 'running' in between)
+
+    expect(ap.getStatus().status).toBe('halted');
+    expect(mockExecFileSync).toHaveBeenCalledTimes(1); // latch: PD is not re-spammed
+  });
+
+  it('non-zero exit with a billing string is a real crash (partition gated on exitCode === 0)', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    vi.spyOn(ap as any, 'tailStdoutLog').mockReturnValue('Usage credits required for 1M context');
+    capturedOnExit!(1, 0);
+
+    expect(ap.getCrashCount()).toBe(1);
+    expect(allRestartsLogText()).not.toContain('MODEL_BILLING_CONFIG');
+    expect(mockExecFileSync).not.toHaveBeenCalled();
+  });
+});
