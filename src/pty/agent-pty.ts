@@ -137,13 +137,21 @@ export class AgentPTY {
     ptyEnv['CLAUDE_CODE_DISABLE_AUTOUPDATE'] = 'true';
     ptyEnv['DISABLE_AUTOUPDATER'] = 'true';
 
-    // SYS-1M-PREVENT: force the standard (non-1M) context window for an explicit
-    // non-Opus model so an explicit-model agent on a no-credit plan cannot
-    // billing-gate-halt at session start (the improver-1M restart loop, PR #62).
-    // Stops the class at source; SYS-1M-DETECT (agent-process.ts) only catches it
-    // after the fact. Set ONLY when the agent's .env (sourced above) did not
-    // already choose — opt-in/opt-out is respected. See shouldDisable1MContext
-    // for the full scoping rationale.
+    // SYS-1M-PREVENT (BEST-EFFORT defense-in-depth — NOT the load-bearing guard;
+    // SYS-1M-DETECT in agent-process.ts is). For an explicit non-Opus model with
+    // no .env choice already made, default CLAUDE_CODE_DISABLE_1M_CONTEXT=true to
+    // force the standard window. Honoured by current Claude Code (v2.1.162 reads
+    // it and disables 1M — see shouldDisable1MContext), but effectiveness against
+    // the original improver-1M incident is LIMITED, by design and by version:
+    //   - On v2.1.162 the auto-1M default is OPUS-ONLY; explicit Sonnet/Haiku do
+    //     not auto-1M, so this env-set is a NO-OP for the models it targets here.
+    //   - It only bites on a CC version that BOTH auto-1M's a non-Opus model AND
+    //     honours this var. v2.1.111 (the incident version) auto-1M'd Sonnet but
+    //     did NOT honour the var — improver's .env already had it set and still
+    //     looped; the effective fix was unpinning config.model (PR #62).
+    // So this is forward-looking belt-and-suspenders for a future CC regression.
+    // Set ONLY when the agent's .env (sourced above) did not already choose —
+    // opt-in/opt-out respected. The real guard if 1M ever gates is DETECT.
     if (AgentPTY.shouldDisable1MContext(this.config, ptyEnv['CLAUDE_CODE_DISABLE_1M_CONTEXT'] !== undefined)) {
       ptyEnv['CLAUDE_CODE_DISABLE_1M_CONTEXT'] = 'true';
     }
@@ -314,9 +322,17 @@ export class AgentPTY {
    * inherits that default; on a plan without 1M usage credits the session fails
    * at the billing gate at SESSION START (an empty context) and Claude Code
    * exits 0 — the daemon then halts the agent in a restart loop (the live
-   * improver-1M incident, fixed reactively via the PR #62 unpin). This guard
-   * prevents the class at source; SYS-1M-DETECT (agent-process.ts handleExit)
-   * only catches it after the fact.
+   * improver-1M incident, fixed by the PR #62 config.model unpin).
+   *
+   * This is BEST-EFFORT defense-in-depth, NOT the load-bearing guard — that is
+   * SYS-1M-DETECT (agent-process.ts handleExit), which catches + escalates the
+   * gate regardless of version. The env var is honoured by current Claude Code
+   * (v2.1.162: it disables both the [1m]-suffix and auto-default 1M paths), but
+   * on v2.1.162 the auto-default is Opus-only, so for the explicit Sonnet/Haiku
+   * this returns true for, there is no 1M to disable (a no-op on current CC). It
+   * was also ineffective on v2.1.111 (improver's .env already set it and still
+   * looped). So it only bites on a future CC that both auto-1M's a non-Opus
+   * model AND honours this var — forward-looking belt-and-suspenders.
    *
    * Scoping is least-surprise:
    *   - explicitSetting → the agent's .env already set the var (true OR false);
