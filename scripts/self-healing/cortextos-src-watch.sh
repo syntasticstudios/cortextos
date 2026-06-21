@@ -32,6 +32,29 @@ if [ -z "$REMOTE_SHA" ]; then
   exit 0
 fi
 
+# Also verify the live daemon's dist — the daemon may run from a different
+# git worktree whose dist/.build-sha can lag origin/main independently of
+# this shared CLI dist (SYS-DAEMON-DIST-LAG: src-watch once masked a 1-commit
+# lag because it only checked REPO_ROOT/dist, not the daemon's worktree dist).
+_DAEMON_PID=$(ps -A -o pid,args 2>/dev/null | awk '/dist\/daemon\.js/ && !/awk/ {print $1; exit}' || true)
+if [ -n "$_DAEMON_PID" ]; then
+  _DAEMON_EXE=$(ps -p "$_DAEMON_PID" -o args= 2>/dev/null | awk '{print $2}' || true)
+  if [[ "$_DAEMON_EXE" == */dist/daemon.js ]]; then
+    _DAEMON_WORKTREE="${_DAEMON_EXE%/dist/daemon.js}"
+    if [ "$_DAEMON_WORKTREE" != "$REPO_ROOT" ]; then
+      _DAEMON_SHA=$(cat "$_DAEMON_WORKTREE/dist/.build-sha" 2>/dev/null | tr -d '[:space:]' || echo "")
+      if [ -n "$_DAEMON_SHA" ] && ! git merge-base --is-ancestor "$REMOTE_SHA" "$_DAEMON_SHA" 2>/dev/null; then
+        echo "[cortextos-src-watch] WARNING: daemon worktree dist stale (daemon ${_DAEMON_SHA:0:8} missing origin/main ${REMOTE_SHA:0:8}) — worktree: $_DAEMON_WORKTREE" >&2
+        cortextos bus send-message platform-director normal \
+          "[cortextos-src-watch] daemon dist lag: $_DAEMON_WORKTREE built at ${_DAEMON_SHA:0:8}, origin/main is ${REMOTE_SHA:0:8} — rebuild + restart needed" \
+          2>/dev/null || true
+      else
+        echo "[cortextos-src-watch] daemon worktree dist OK (${_DAEMON_SHA:0:8} includes origin/main ${REMOTE_SHA:0:8})"
+      fi
+    fi
+  fi
+fi
+
 # Up-to-date if: BUILD_SHA equals REMOTE_SHA, OR origin/main is already an
 # ancestor of BUILD_SHA (local HEAD is a merge commit that includes origin/main).
 if [ -n "$BUILD_SHA" ] && git merge-base --is-ancestor "$REMOTE_SHA" "$BUILD_SHA" 2>/dev/null; then
