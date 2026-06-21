@@ -169,50 +169,22 @@ function computeNextFireAt(cron: CronDefinition, referenceMs: number): number {
 
 const RETRY_DELAYS_MS = [1_000, 4_000, 16_000];
 
-// Per-attempt timeout for onFire.  If the PTY injection hangs (e.g. wedged
-// agent session), onFire never resolves, sc.firing stays true, and all later
-// ticks silently skip that cron.  This timeout un-wedges that state:
-// fireWithRetry catches the timeout error, retries (per RETRY_DELAYS_MS),
-// then returns false — allowing tick() to clear sc.firing and reschedule
-// the next slot. (SYS-CRON-FIRING-FLAG)
-//
-// Read at call time (not module load time) so tests can override via
-// process.env.CRON_ONFIRE_TIMEOUT_MS without re-importing the module.
-function getOnFireTimeoutMs(): number {
-  const env = process.env.CRON_ONFIRE_TIMEOUT_MS;
-  if (env !== undefined) {
-    const n = parseInt(env, 10);
-    if (!isNaN(n) && n > 0) return n;
-  }
-  return 45_000;
-}
-
-// Typed error so fireWithRetry can distinguish timeout from other failures
-// and emit a distinct 'timed_out' execution-log event that the wedge-watchdog
-// can key on directly. (SYS-CRON-FIRING-FLAG / devops-monitor SO note)
-export class CronOnFireTimeoutError extends Error {
-  readonly timeoutMs: number;
-  constructor(timeoutMs: number) {
-    super(`onFire timed out after ${timeoutMs}ms — agent session may be wedged`);
-    this.name = 'CronOnFireTimeoutError';
-    this.timeoutMs = timeoutMs;
-  }
-}
-
-function onFireWithTimeout(
-  onFire: (c: CronDefinition) => Promise<void> | void,
-  cron: CronDefinition,
-  timeoutMs: number,
-): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new CronOnFireTimeoutError(timeoutMs));
-    }, timeoutMs);
-    Promise.resolve(onFire(cron)).then(
-      () => { clearTimeout(timer); resolve(); },
-      (err: unknown) => { clearTimeout(timer); reject(err); },
+/**
+ * Race `promise` against a `ms`-millisecond deadline.
+ * Rejects with `Error("onFire timeout after Nms: <label>")` if the deadline
+ * fires first (SYS-CRON-FIRING-FLAG: prevents a wedged PTY from hanging
+ * `onFire` indefinitely and permanently blocking `sc.firing`).
+ * Cleans up its own setTimeout on whichever branch wins.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let handle: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    handle = setTimeout(
+      () => reject(new Error(`onFire timeout after ${ms}ms: ${label}`)),
+      ms,
     );
   });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(handle!));
 }
 
 async function fireWithRetry(
@@ -220,12 +192,13 @@ async function fireWithRetry(
   agentName: string,
   onFire: (c: CronDefinition) => Promise<void> | void,
   logger: (msg: string) => void,
+  timeoutMs: number,
 ): Promise<boolean> {
   const maxAttempts = RETRY_DELAYS_MS.length + 1; // 4 attempts total
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const start = Date.now();
     try {
-      await onFireWithTimeout(onFire, cron, getOnFireTimeoutMs());
+      await withTimeout(Promise.resolve(onFire(cron)), timeoutMs, cron.name);
       appendExecutionLog(agentName, {
         ts: new Date().toISOString(),
         cron: cron.name,
@@ -238,7 +211,7 @@ async function fireWithRetry(
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       const duration_ms = Date.now() - start;
-      const isTimeout = err instanceof CronOnFireTimeoutError;
+      const isTimeout = err instanceof Error && err.message.startsWith('onFire timeout after');
       if (attempt < RETRY_DELAYS_MS.length) {
         const delay = RETRY_DELAYS_MS[attempt];
         logger(
@@ -313,6 +286,14 @@ export class CronScheduler {
 
   /** Epoch ms of the tick interval, exposed so tests can override. */
   static readonly TICK_INTERVAL_MS = 30_000;
+
+  /**
+   * Per-attempt onFire timeout in ms.  A wedged PTY hangs onFire indefinitely;
+   * this caps each attempt so `sc.firing` is eventually cleared and the
+   * scheduler keeps trying on later ticks (SYS-CRON-FIRING-FLAG).
+   * Mutable so unit tests can set a sub-second value.
+   */
+  static ON_FIRE_TIMEOUT_MS = 120_000;
 
   constructor(opts: CronSchedulerOptions) {
     this.agentName = opts.agentName;
@@ -534,7 +515,7 @@ export class CronScheduler {
         );
       }
 
-      const success = await fireWithRetry(cron, this.agentName, this.onFire, this.logger);
+      const success = await fireWithRetry(cron, this.agentName, this.onFire, this.logger, CronScheduler.ON_FIRE_TIMEOUT_MS);
 
       if (success) {
         // Persist last_fired_at + fire_count to disk.
