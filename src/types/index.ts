@@ -722,7 +722,7 @@ export interface CronSummaryRow {
    * Outcome of the most recent execution log entry.
    * Null when the cron has never fired.
    */
-  lastStatus: 'fired' | 'retried' | 'failed' | null;
+  lastStatus: 'fired' | 'retried' | 'failed' | 'timed_out' | null;
   /**
    * ISO 8601 timestamp of the next scheduled fire.
    * Computed from the cron's schedule + last_fired_at (or now).
