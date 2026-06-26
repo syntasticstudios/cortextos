@@ -38,8 +38,27 @@ function seedAgentConfig(frameworkRoot: string, org: string, agent: string, conf
   writeFileSync(join(dir, 'config.json'), JSON.stringify(config), 'utf-8');
 }
 
+/**
+ * Seed an agent's cron-execution.log with `fired` entries so the idle-but-alive
+ * guard (getLastCronFireMs) sees cron evidence. Path mirrors
+ * cronExecutionLogPathFor: {ctxRoot}/.cortextOS/state/agents/{agent}/cron-execution.log
+ */
+function seedCronLog(ctxRoot: string, agent: string, firedAtIso: string[]): void {
+  const dir = join(ctxRoot, '.cortextOS', 'state', 'agents', agent);
+  mkdirSync(dir, { recursive: true });
+  const lines = firedAtIso
+    .map(ts => JSON.stringify({ ts, cron: 'heartbeat', status: 'fired', attempt: 1, duration_ms: 0, error: null }))
+    .join('\n');
+  writeFileSync(join(dir, 'cron-execution.log'), lines + '\n', 'utf-8');
+}
+
+const isoMinutesAgo = (m: number): string => new Date(Date.now() - m * 60 * 1000).toISOString();
+
 const STALE = '2020-01-01T00:00:00.000Z'; // years old → stale under any threshold
 const FRESH = new Date().toISOString();
+// A cron fired well after the stale heartbeat and past the 10-min processing
+// grace = the daemon sent work the agent never processed = genuine wedge.
+const WEDGE_CRON = (): string[] => [isoMinutesAgo(20)];
 
 describe('staleWatchdogEnabled (safety guard)', () => {
   const original = process.env.CTX_STALE_WATCHDOG;
@@ -107,8 +126,9 @@ describe('StaleAgentWatchdog.checkAndRestart behavior', () => {
     rmSync(frameworkRoot, { recursive: true, force: true });
   });
 
-  it('restarts a running agent whose heartbeat is stale', async () => {
+  it('restarts a running agent whose heartbeat is stale AND has an unprocessed cron (wedge)', async () => {
     seedHeartbeat(ctxRoot, 'a1', STALE);
+    seedCronLog(ctxRoot, 'a1', WEDGE_CRON()); // cron fired after hb, past grace
     const wd = new StaleAgentWatchdog(
       fakeAgentManager([{ name: 'a1', status: 'running' }], spies),
       ctxRoot,
@@ -240,9 +260,90 @@ describe('StaleAgentWatchdog fail-safe on bad/missing/ambiguous signal (EXP-DRIV
 
   // C2-analog: stale with NO rate-limit signal in the log = genuine freeze.
   // Coverage must NOT be lost — the recoverable restart still fires.
-  it('C2: stale + no rate-limit signal → restart still fires (coverage preserved)', async () => {
+  it('C2: stale + no rate-limit signal + unprocessed cron → restart still fires (coverage preserved)', async () => {
     seedHeartbeat(ctxRoot, 'a1', STALE);
     seedAgentLog(ctxRoot, 'a1', 'normal heartbeat output\nworking on task\n');
+    seedCronLog(ctxRoot, 'a1', WEDGE_CRON()); // wedge: cron fired but unprocessed
+    const wd = new StaleAgentWatchdog(
+      fakeAgentManager([{ name: 'a1', status: 'running' }], spies),
+      ctxRoot,
+      frameworkRoot,
+    );
+    await wd.checkAndRestart();
+    expect(spies.restartAgent).toHaveBeenCalledWith('a1');
+  });
+});
+
+/**
+ * SYS-STALE-WATCHDOG-IDLE-FP — idle-but-alive must NOT be restarted.
+ *
+ * A stale heartbeat with no UNPROCESSED cron means the agent simply hasn't been
+ * given work since it last checked in (sparse crons refresh the heartbeat only
+ * when they fire). The flat 15-min threshold conflated this with a wedge and
+ * restarted healthy idle agents every cycle, climbing the crash counter toward
+ * a false daily HALT. The guard requires an unprocessed cron (fired after the
+ * heartbeat, past the processing grace) before treating staleness as a wedge.
+ */
+describe('StaleAgentWatchdog idle-but-alive guard (SYS-STALE-WATCHDOG-IDLE-FP)', () => {
+  let ctxRoot: string;
+  let frameworkRoot: string;
+  let spies: Spies;
+
+  beforeEach(() => {
+    ctxRoot = mkdtempSync(join(tmpdir(), 'cortextos-sw-idle-ctx-'));
+    frameworkRoot = mkdtempSync(join(tmpdir(), 'cortextos-sw-idle-fw-'));
+    spies = { restartAgent: vi.fn(), stopAgent: vi.fn() };
+  });
+  afterEach(() => {
+    rmSync(ctxRoot, { recursive: true, force: true });
+    rmSync(frameworkRoot, { recursive: true, force: true });
+  });
+
+  // Stale heartbeat, but NO cron log at all → no work was sent → idle, not wedged.
+  it('stale + no cron evidence → no restart (idle-but-alive)', async () => {
+    seedHeartbeat(ctxRoot, 'a1', isoMinutesAgo(30));
+    const wd = new StaleAgentWatchdog(
+      fakeAgentManager([{ name: 'a1', status: 'running' }], spies),
+      ctxRoot,
+      frameworkRoot,
+    );
+    await wd.checkAndRestart();
+    expect(spies.restartAgent).not.toHaveBeenCalled();
+    expect(spies.stopAgent).not.toHaveBeenCalled();
+  });
+
+  // Newest cron fired BEFORE the last heartbeat → the agent already pinged after
+  // its last work → idle since then, not wedged.
+  it('stale + newest cron older than heartbeat → no restart', async () => {
+    seedHeartbeat(ctxRoot, 'a1', isoMinutesAgo(30));
+    seedCronLog(ctxRoot, 'a1', [isoMinutesAgo(45)]); // cron predates the heartbeat
+    const wd = new StaleAgentWatchdog(
+      fakeAgentManager([{ name: 'a1', status: 'running' }], spies),
+      ctxRoot,
+      frameworkRoot,
+    );
+    await wd.checkAndRestart();
+    expect(spies.restartAgent).not.toHaveBeenCalled();
+  });
+
+  // Cron fired after the heartbeat but still within the processing grace → the
+  // agent may still be booting/processing it → don't declare a wedge yet.
+  it('stale + cron after heartbeat but within processing grace → no restart', async () => {
+    seedHeartbeat(ctxRoot, 'a1', isoMinutesAgo(30));
+    seedCronLog(ctxRoot, 'a1', [isoMinutesAgo(3)]); // < 10-min grace
+    const wd = new StaleAgentWatchdog(
+      fakeAgentManager([{ name: 'a1', status: 'running' }], spies),
+      ctxRoot,
+      frameworkRoot,
+    );
+    await wd.checkAndRestart();
+    expect(spies.restartAgent).not.toHaveBeenCalled();
+  });
+
+  // Cron fired after the heartbeat AND past the grace → unprocessed work → wedge.
+  it('stale + unprocessed cron past grace → restart (genuine wedge)', async () => {
+    seedHeartbeat(ctxRoot, 'a1', isoMinutesAgo(30));
+    seedCronLog(ctxRoot, 'a1', [isoMinutesAgo(45), isoMinutesAgo(20)]); // newest is past grace
     const wd = new StaleAgentWatchdog(
       fakeAgentManager([{ name: 'a1', status: 'running' }], spies),
       ctxRoot,

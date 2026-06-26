@@ -3,12 +3,38 @@ import { join } from 'path';
 import type { AgentManager } from './agent-manager.js';
 import { readAllHeartbeats, isHeartbeatStale } from '../bus/heartbeat.js';
 import { incrementCrashCount } from './crash-counter.js';
+import { cronExecutionLogPathFor } from '../bus/crons-schema.js';
 import { ensureDir } from '../utils/atomic.js';
-import type { BusPaths, AgentConfig } from '../types/index.js';
+import type { BusPaths, AgentConfig, CronExecutionLogEntry } from '../types/index.js';
 
 const DEFAULT_CHECK_INTERVAL_MS = 5 * 60 * 1000;    // 5 minutes
 const DEFAULT_STALE_THRESHOLD_MS = 15 * 60 * 1000;  // 15 minutes
 const RESTART_COOLDOWN_MS = 3 * 60 * 1000;           // 3 minutes between restarts
+
+/**
+ * Idle-but-alive guard (SYS-STALE-WATCHDOG-IDLE-FP).
+ *
+ * A stale heartbeat alone does NOT mean an agent is wedged. Agents only
+ * refresh their heartbeat when they actually run — on cold-start and when a
+ * cron fires a prompt they process. Most agents have sparse crons (hourly or
+ * less), so between fires the heartbeat legitimately ages PAST the 15-min flat
+ * stale threshold even though the PTY is alive at ~0% CPU and will ping again
+ * on its next cron. Restarting such an idle-but-alive agent is pointless churn
+ * that climbs the crash counter toward a FALSE daily HALT (this loop halted
+ * cortextos-improver/systems-analyst/devops-monitor on 2026-06-23).
+ *
+ * The distinguishing signal — CPU is ~0% for BOTH idle and wedged — is cron
+ * evidence: a genuinely wedged agent has had a cron fired AT it (daemon
+ * injected a prompt) AFTER its last heartbeat that it never processed. An idle
+ * agent has no such unprocessed cron. So before counting a stale heartbeat as a
+ * restart-worthy crash on the non-rate-limited path, we require an unprocessed
+ * cron fire newer than the heartbeat and older than the processing grace below.
+ *
+ * Grace: after a cron fires, the agent needs time to boot/process and emit a
+ * fresh heartbeat (a cold-start can take a couple minutes). If the newest cron
+ * fired within this window, it may still be in flight — don't declare a wedge.
+ */
+const CRON_PROCESSING_GRACE_MS = 10 * 60 * 1000;     // 10 minutes
 
 /**
  * When we detect a rate limit but can't parse a reset time, wait this long
@@ -305,7 +331,40 @@ export class StaleAgentWatchdog {
         }
         this.lastRateLimitRestartAt.set(name, now);
       } else {
-        // Not rate-limited — clear tracking
+        // Not rate-limited. A stale heartbeat here is NOT automatically a
+        // wedge — distinguish idle-but-alive from genuinely wedged using
+        // cron-fire evidence (see CRON_PROCESSING_GRACE_MS doc above).
+        const newestCronFireMs = this.getLastCronFireMs(name);
+        const hbMs = new Date(hb.last_heartbeat).getTime();
+        const now = Date.now();
+        // Wedge requires: a cron fired AFTER the last heartbeat (daemon sent
+        // work the agent didn't process) AND that cron is now past the
+        // processing grace (the agent had time to respond and didn't).
+        const cronAfterHb = newestCronFireMs !== null && newestCronFireMs > hbMs;
+        const cronPastGrace =
+          newestCronFireMs !== null && (now - newestCronFireMs) >= CRON_PROCESSING_GRACE_MS;
+        if (!cronAfterHb || !cronPastGrace) {
+          // Idle-but-alive (no unprocessed cron) — do NOT restart. Throttled log.
+          const idleKey = `idle-${name}`;
+          const lastLog = this.lastLogAt.get(idleKey) ?? 0;
+          if (now - lastLog > 60 * 60 * 1000) {
+            const ageMin = Math.round((now - hbMs) / 60000);
+            const cronAgeStr =
+              newestCronFireMs !== null
+                ? `${Math.round((now - newestCronFireMs) / 60000)}m`
+                : 'none';
+            console.log(
+              `[watchdog] ${name} heartbeat stale (${ageMin}m) but no unprocessed cron ` +
+              `(newest cron fire: ${cronAgeStr}) — idle-but-alive, not restarting`,
+            );
+            this.lastLogAt.set(idleKey, now);
+          }
+          // Clear rate-limit tracking; leave idle throttle key intact.
+          this.rateLimitResetsAt.delete(name);
+          continue;
+        }
+        // Unprocessed cron past grace → genuine wedge. Clear tracking, fall
+        // through to the restart logic below.
         this.rateLimitResetsAt.delete(name);
         this.lastLogAt.delete(name);
       }
@@ -421,6 +480,38 @@ export class StaleAgentWatchdog {
       // Timezone parsing failed — return "now + 30 min" as fallback
       return Date.now() + 30 * 60 * 1000;
     }
+  }
+
+  /**
+   * Epoch-ms of the newest `fired` cron entry for an agent, or null if none.
+   * Used by the idle-but-alive guard to tell a wedge (unprocessed cron newer
+   * than the heartbeat) apart from a healthy idle agent (no recent cron).
+   * Mirrors WedgeWatchdog.checkCronFired but returns the timestamp instead of
+   * applying a lookback window — the caller compares it against the heartbeat.
+   */
+  private getLastCronFireMs(agentName: string): number | null {
+    const logPath = join(this.ctxRoot, cronExecutionLogPathFor(agentName));
+    if (!existsSync(logPath)) return null;
+    try {
+      const lines = readFileSync(logPath, 'utf-8').trim().split('\n');
+      // Lines are oldest→newest; scan newest-first for the latest 'fired'.
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        let entry: CronExecutionLogEntry;
+        try {
+          entry = JSON.parse(line) as CronExecutionLogEntry;
+        } catch {
+          continue;
+        }
+        if (entry.status !== 'fired') continue;
+        const ts = new Date(entry.ts).getTime();
+        return isNaN(ts) ? null : ts;
+      }
+    } catch {
+      /* unreadable — treat as no cron evidence */
+    }
+    return null;
   }
 
   /**
