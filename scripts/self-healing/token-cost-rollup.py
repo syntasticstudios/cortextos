@@ -171,6 +171,101 @@ def agent_working_dir(agent):
 
 
 # --------------------------------------------------------------------------- #
+# Tick-type attribution
+# --------------------------------------------------------------------------- #
+# Each assistant turn is initiated by a preceding user-role entry. Cron fires
+# inject "[CRON FIRED <iso>] <cron-name>: <prompt>" so the cron-name is the turn
+# origin; non-cron turn-starts (founder/agent messages, /commands) = interactive.
+# A downshift decision targets the tick TYPE, not the agent, because cost is
+# ~88% caching / 12% generation and the cheap downshift wins are the high-freq,
+# ~50-token mechanical ticks.
+#
+# THREE tiers (PD gate-review corrected, 3-way):
+#   pure_mechanical — signature alone is sufficient; never reasons (~50-tok out).
+#   conditional     — ~99% mechanical / ~1% DETECTS+acts; signature CANNOT tell a
+#                     mechanical fire from a real-alert fire, so these stay opus
+#                     for now. Per-turn `acted` tags which fires actually mutated
+#                     /escalated, so a future cycle can downshift the 99% safely.
+#   reasoning       — everything else, incl. interactive + any UNMAPPED cron-name
+#                     (default reasoning — conservative).
+PURE_MECHANICAL = {
+    "heartbeat", "status-pulse", "cron-status", "cortextos-src-watch",
+}
+CONDITIONAL = {
+    "cron-drift-watchdog", "vault-task-reconcile", "keychain-oauth-refresh",
+    "human-task-pulse", "fleet-cascade-sync", "daily-vault-log",
+}
+
+CRON_RE = re.compile(r"\s*\[CRON FIRED[^\]]*\]\s*([A-Za-z0-9._-]+)\s*:")
+# Mutating / escalating actions that mark a conditional fire as having ACTED.
+MUTATING_RE = re.compile(
+    r"\b(send-message|send-telegram|create-task|complete-task|update-task)\b"
+    r"|git\s+commit")
+
+
+def tick_class(origin):
+    if origin in PURE_MECHANICAL:
+        return "pure_mechanical"
+    if origin in CONDITIONAL:
+        return "conditional"
+    return "reasoning"
+
+
+def _user_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def turn_origin_from_user(obj):
+    """For a user-role entry, return (is_turn_start, origin, turn_uuid).
+
+    A user entry carrying a tool_result is a continuation of the SAME turn, not
+    a new turn-start — return is_turn_start=False so the caller keeps the prior
+    origin. A real turn-start parses its text: cron-name if it matches the
+    CRON-FIRED marker, else "interactive".
+    """
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return (False, None, None)
+    content = msg.get("content")
+    if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in content):
+        return (False, None, None)  # tool_result continuation
+    text = _user_text(content)
+    m = CRON_RE.match(text) if text else None
+    origin = m.group(1) if m else "interactive"
+    return (True, origin, obj.get("uuid"))
+
+
+def message_acted(obj):
+    """True if this assistant message emits a mutating/escalating tool call."""
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return False
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    for b in content:
+        if not isinstance(b, dict) or b.get("type") != "tool_use":
+            continue
+        inp = b.get("input")
+        cmd = ""
+        if isinstance(inp, dict):
+            cmd = str(inp.get("command", "")) or json.dumps(inp)
+        elif inp is not None:
+            cmd = str(inp)
+        if MUTATING_RE.search(cmd):
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
 # Transcript tail
 # --------------------------------------------------------------------------- #
 
@@ -186,6 +281,13 @@ def extract_usage_row(obj):
         return None
     msg_id = msg.get("id")
     if not msg_id:
+        return None
+
+    # Skip Claude Code synthetic/injected placeholder messages (model
+    # "<synthetic>"): they carry an all-zero usage block, are not billed API
+    # turns, and only dilute msg_count / avg_output_tokens.
+    model = msg.get("model") or "unknown"
+    if "synthetic" in model.lower():
         return None
 
     def n(v):
@@ -210,7 +312,7 @@ def extract_usage_row(obj):
         "msg_id": msg_id,
         "row": {
             "ts": ts,
-            "model": msg.get("model") or "unknown",
+            "model": model,
             "input_tokens": n(usage.get("input_tokens")),
             "output_tokens": n(usage.get("output_tokens")),
             "cache_read_tokens": n(usage.get("cache_read_input_tokens")),
@@ -223,18 +325,23 @@ def extract_usage_row(obj):
     }
 
 
-def tail_session(path, offset, last_msg_id):
+def tail_session(path, offset, last_msg_id, last_origin, last_turn_id):
     """Read complete new lines from `offset`; dedup by message.id.
 
-    Returns (new_rows, new_offset, new_last_msg_id). Only fully-terminated
-    lines are consumed; a trailing partial line (live session mid-write) is
-    left for the next run. `last_msg_id` suppresses a streaming group that
-    straddles the offset boundary (already emitted on the prior run).
+    Threads turn state (tick origin + turn uuid) so each assistant row is
+    attributed to the kind of turn that triggered it. The state is carried
+    across runs (a turn that straddles the byte-offset boundary keeps its
+    origin/turn_id from the prior run).
+
+    Returns (new_rows, new_offset, new_last_msg_id, cur_origin, cur_turn_id).
+    Only fully-terminated lines are consumed; a trailing partial line (live
+    session mid-write) is left for the next run.
     """
+    fail = ([], offset, last_msg_id, last_origin, last_turn_id)
     try:
         size = os.path.getsize(path)
     except OSError:
-        return [], offset, last_msg_id
+        return fail
 
     if offset > size:
         # File shrank/rotated (rare) — restart from 0.
@@ -242,20 +349,21 @@ def tail_session(path, offset, last_msg_id):
 
     rows = []
     seen = set()
-    new_offset = offset
     cur_last = last_msg_id
+    cur_origin = last_origin or "interactive"
+    cur_turn_id = last_turn_id
 
     try:
         with open(path, "rb") as fh:
             fh.seek(offset)
             data = fh.read()
     except OSError:
-        return [], offset, last_msg_id
+        return fail
 
     # Consume only up to the last newline; keep trailing partial for next run.
     last_nl = data.rfind(b"\n")
     if last_nl == -1:
-        return [], offset, last_msg_id
+        return fail
     consumable = data[: last_nl + 1]
     new_offset = offset + len(consumable)
 
@@ -268,6 +376,14 @@ def tail_session(path, offset, last_msg_id):
             continue  # skip corrupt line
         if not isinstance(obj, dict):
             continue
+
+        if obj.get("type") == "user":
+            is_start, origin, tuid = turn_origin_from_user(obj)
+            if is_start:
+                cur_origin = origin
+                cur_turn_id = tuid
+            continue
+
         extracted = extract_usage_row(obj)
         if not extracted:
             continue
@@ -277,10 +393,15 @@ def tail_session(path, offset, last_msg_id):
         if mid == cur_last or mid in seen:
             continue
         seen.add(mid)
-        rows.append(extracted["row"])
+        row = extracted["row"]
+        row["tick_origin"] = cur_origin
+        row["tick_class"] = tick_class(cur_origin)
+        row["turn_id"] = cur_turn_id
+        row["acted"] = message_acted(obj)
+        rows.append(row)
         cur_last = mid
 
-    return rows, new_offset, cur_last
+    return rows, new_offset, cur_last, cur_origin, cur_turn_id
 
 
 def rollup_agent(agent):
@@ -311,13 +432,20 @@ def rollup_agent(agent):
     for sess_path in sorted(glob.glob(os.path.join(tdir, "*.jsonl"))):
         sess_file = os.path.basename(sess_path)
         meta = sessions.get(sess_file) or {}
-        offset = meta.get("offset", 0) if isinstance(meta, dict) else 0
-        last_mid = meta.get("last_msg_id") if isinstance(meta, dict) else None
+        if not isinstance(meta, dict):
+            meta = {}
+        offset = meta.get("offset", 0)
+        last_mid = meta.get("last_msg_id")
+        last_origin = meta.get("last_tick_origin")
+        last_turn = meta.get("last_turn_id")
 
-        rows, new_offset, new_last = tail_session(sess_path, offset, last_mid)
+        rows, new_offset, new_last, new_origin, new_turn = tail_session(
+            sess_path, offset, last_mid, last_origin, last_turn)
         sessions[sess_file] = {
             "offset": new_offset,
             "last_msg_id": new_last,
+            "last_tick_origin": new_origin,
+            "last_turn_id": new_turn,
             "mtime": os.path.getmtime(sess_path),
         }
         for r in rows:
@@ -414,6 +542,22 @@ def aggregate_costs(agents, price_table):
     window_start = None
     window_end = None
 
+    def _new_class():
+        return {
+            "input": 0, "output": 0, "cache_read": 0,
+            "cache_write_5m": 0, "cache_write_1h": 0,
+            "est_usd": 0.0, "msg_count": 0,
+        }
+    by_tick_class = {
+        "pure_mechanical": _new_class(),
+        "conditional": _new_class(),
+        "reasoning": _new_class(),
+    }
+    by_tick_origin = {}    # origin -> {"est_usd", "msg_count", "output"}
+    # Conditional-tier acted attribution, keyed per TURN (session_id, turn_id):
+    # a turn is "acted" if ANY of its assistant messages emitted a mutating call.
+    cond_turn_acted = {}
+
     for agent in agents:
         name = agent["name"]
         log_path = os.path.join(LOGS_DIR, name, "token-usage.jsonl")
@@ -473,6 +617,31 @@ def aggregate_costs(agents, price_table):
                             day, {"total_est_usd": 0.0, "per_agent": {}})
                         d["total_est_usd"] += c
                         d["per_agent"][name] = d["per_agent"].get(name, 0.0) + c
+
+                    # Tick-type attribution.
+                    out_tok = row.get("output_tokens", 0)
+                    origin = row.get("tick_origin") or "interactive"
+                    tc = row.get("tick_class") or tick_class(origin)
+                    cls = by_tick_class.setdefault(tc, _new_class())
+                    cls["input"] += row.get("input_tokens", 0)
+                    cls["output"] += out_tok
+                    cls["cache_read"] += row.get("cache_read_tokens", 0)
+                    cls["cache_write_5m"] += w5m
+                    cls["cache_write_1h"] += w1h
+                    cls["est_usd"] += c
+                    cls["msg_count"] += 1
+
+                    o = by_tick_origin.setdefault(
+                        origin, {"est_usd": 0.0, "msg_count": 0, "output": 0})
+                    o["est_usd"] += c
+                    o["msg_count"] += 1
+                    o["output"] += out_tok
+
+                    if tc == "conditional":
+                        tkey = (row.get("session_id"), row.get("turn_id"))
+                        cond_turn_acted[tkey] = (
+                            cond_turn_acted.get(tkey, False)
+                            or bool(row.get("acted")))
         except OSError:
             continue
 
@@ -492,6 +661,33 @@ def aggregate_costs(agents, price_table):
                 d["per_agent"].items(), key=lambda kv: -kv[1])},
         }
 
+    # Finalize by_tick_class: round dollars, add avg_output_tokens (output per
+    # assistant message — a low avg confirms a tier is downshift-safe).
+    for tc, cls in by_tick_class.items():
+        mc = cls["msg_count"]
+        cls["est_usd"] = round(cls["est_usd"], 4)
+        cls["avg_output_tokens"] = round(cls["output"] / mc, 1) if mc else 0
+    # Conditional acted sub-counts: turns that mutated/escalated (reasoning
+    # fires) vs turns that only read/heartbeated (mechanical fires). This is the
+    # outcome-tag that lets a future cycle downshift the mechanical 99% while
+    # keeping the acting 1% on opus.
+    by_tick_class["conditional"]["reasoning_fires"] = sum(
+        1 for v in cond_turn_acted.values() if v)
+    by_tick_class["conditional"]["mechanical_fires"] = sum(
+        1 for v in cond_turn_acted.values() if not v)
+
+    # by_tick_origin: add avg_output_tokens, round, order newest=highest $.
+    by_tick_origin_out = {}
+    for origin, o in sorted(by_tick_origin.items(),
+                            key=lambda kv: -kv[1]["est_usd"]):
+        mc = o["msg_count"]
+        by_tick_origin_out[origin] = {
+            "tick_class": tick_class(origin),
+            "est_usd": round(o["est_usd"], 4),
+            "msg_count": mc,
+            "avg_output_tokens": round(o["output"] / mc, 1) if mc else 0,
+        }
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "window_start": window_start,
@@ -502,6 +698,8 @@ def aggregate_costs(agents, price_table):
         "price_table_effective_date": price_table.get("effective_date"),
         "totals": totals,
         "per_agent": per_agent,
+        "by_tick_class": by_tick_class,
+        "by_tick_origin": by_tick_origin_out,
         "by_day": by_day_out,
     }
 
@@ -539,6 +737,18 @@ def main(argv):
           f"cache_write_5m={cost['totals']['cache_write_5m']} "
           f"cache_write_1h={cost['totals']['cache_write_1h']} "
           f"est_usd=${cost['totals']['est_usd']}")
+    tot = cost["totals"]["est_usd"] or 1.0
+    for tc in ("pure_mechanical", "conditional", "reasoning"):
+        cls = cost["by_tick_class"].get(tc, {})
+        extra = ""
+        if tc == "conditional":
+            extra = (f" [mechanical_fires={cls.get('mechanical_fires', 0)} "
+                     f"reasoning_fires={cls.get('reasoning_fires', 0)}]")
+        print(f"[token-cost-rollup]   {tc:15} "
+              f"${cls.get('est_usd', 0):>9.2f} "
+              f"({100 * cls.get('est_usd', 0) / tot:4.1f}% $) "
+              f"msgs={cls.get('msg_count', 0):>6} "
+              f"avg_out={cls.get('avg_output_tokens', 0)}{extra}")
     print(f"[token-cost-rollup] cost.json -> {COST_JSON_PATH} "
           f"({len(cost['by_day'])} days bucketed)")
     return 0
