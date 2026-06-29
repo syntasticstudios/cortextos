@@ -21,6 +21,12 @@
 #
 # EXIT: 0 = clean. 1 = LEAK FOUND (summary on stdout, NO values). 2 = probe-blind.
 # stdlib/grep only. Durable-cron convention: $CTX_FRAMEWORK_ROOT-relative, git-tracked.
+#
+# RUNTIME GUARDRAIL (PD 2026-06-29): full-store scan currently runs >2min — fine at
+#   the 6h cadence (no overlap risk). BUT if store growth pushes runtime toward a
+#   meaningful fraction of the cadence (recheck if the store ~doubles, escalate at
+#   >30min/fire), scope this incremental/path-bounded (e.g. mtime-windowed or
+#   per-store-newest) instead of re-grepping the whole tree every fire.
 
 set -uo pipefail
 
