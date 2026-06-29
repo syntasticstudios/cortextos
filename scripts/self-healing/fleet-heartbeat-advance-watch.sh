@@ -184,11 +184,44 @@ def _expand_cron_field(field, lo, hi):
         raise ValueError("empty field")
     return sorted(out)
 
+def _shorthand_minutes(expr):
+    """Parse a duration SHORTHAND like '4h','30min','90m','2hr','1d','240' -> minutes.
+    The daemon/config accept BOTH 5-field cron exprs AND these shorthands (a cadence
+    change can rewrite '7,37 * * * *' to '4h'); the 5-field parser returns None on a
+    shorthand -> false fallback to the WARN floor. Handling the shorthand here keys the
+    threshold to the TRUE cadence, so a cadence-LENGTHENING change (30min->4h) no longer
+    leaves a false-overdue window. None if not a recognised shorthand."""
+    s = expr.strip().lower()
+    if not s:
+        return None
+    if s.isdigit():            # bare integer = minutes (matches update-cron-fire --interval)
+        return int(s)
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    if i == 0:
+        return None
+    num = int(s[:i])
+    unit = s[i:].strip()
+    if unit in ("h", "hr", "hrs", "hour", "hours"):
+        return num * 60
+    if unit in ("m", "min", "mins", "minute", "minutes"):
+        return num
+    if unit in ("d", "day", "days"):
+        return num * 1440
+    if unit in ("s", "sec", "secs", "second", "seconds"):
+        return max(1, num // 60)
+    return None
+
 def cron_interval_minutes(expr):
-    """Max consecutive gap (minutes) between fires of a 5-field cron expr, over a
-    24h window. This is the LONGEST an agent legitimately goes silent between ticks,
-    so thresholds derived from it never false-fire on the slow side. Returns None
-    if the expr can't be parsed or constrains day/month/dow (not a pure intraday cron)."""
+    """Max consecutive gap (minutes) between fires of a heartbeat schedule. Accepts a
+    duration SHORTHAND ('4h','30min',...) OR a 5-field cron expr. For a cron expr this is
+    the LONGEST an agent legitimately goes silent between ticks, so thresholds derived
+    from it never false-fire on the slow side. Returns None if neither form parses or the
+    expr constrains day/month/dow (not a pure intraday cron)."""
+    sh = _shorthand_minutes(expr)
+    if sh is not None:
+        return sh
     parts = expr.split()
     if len(parts) < 5:
         return None
