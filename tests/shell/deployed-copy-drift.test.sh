@@ -98,6 +98,57 @@ echo "$OUT" | grep -q "SKIP orphan.*orphan.sh" && ok "C5: orphan entry skipped w
 [ "$RC" -eq 0 ] && ok "C5: orphan alone does not make check fail" || bad "C5: orphan made check exit $RC"
 rm -rf "$R"
 
+# ── Direction guard (SYS-DEPLOY-SYNC-DIRGUARD) — git-based fixtures ──────────
+# The automated origin/main path must NOT clobber an AHEAD/DIVERGED (manual/unmerged)
+# deployed copy; --force overrides for a deliberate reconcile; BEHIND/missing still sync.
+gitcase() {  # builds a real repo with origin/main + an ahead branch for blob-ancestry
+  R=$(mktemp -d /tmp/depdir.XXXXXX); REPO="$R/repo"; CTX="$R/ctx"
+  mkdir -p "$REPO/bin" "$CTX/scripts"
+  ( cd "$REPO"; git init -q; git config user.email t@t; git config user.name t
+    printf 'v1\n' > bin/quota-watchdog.sh; git add -A; git commit -qm v1
+    git branch -m main
+    printf 'v2-canonical\n' > bin/quota-watchdog.sh; git add -A; git commit -qm v2
+    git update-ref refs/remotes/origin/main HEAD
+    git checkout -q -b ahead-branch
+    printf 'v3-ahead\n' > bin/quota-watchdog.sh; git add -A; git commit -qm v3
+    git checkout -q main ) >/dev/null 2>&1
+  REG="$R/registry"; printf 'scripts/quota-watchdog.sh | bin/quota-watchdog.sh\n' > "$REG"
+}
+gitsync() { DEPLOYED_REGISTRY="$REG" DEPLOYED_REPO_ROOT="$REPO" CTX_ROOT="$CTX" bash "$SYNC" "$@"; }
+DEP="scripts/quota-watchdog.sh"
+
+echo "== [C6] BEHIND deployed copy → apply SYNCS canonical down =="
+gitcase; printf 'v1\n' > "$CTX/$DEP"   # v1 = ancestor of origin/main
+gitsync apply >/dev/null 2>&1
+grep -q 'v2-canonical' "$CTX/$DEP" && ok "C6: behind copy synced to canonical" || bad "C6: behind copy NOT synced"
+rm -rf "$R"
+
+echo "== [C7] AHEAD deployed copy → apply SKIPS (no clobber) =="
+gitcase; printf 'v3-ahead\n' > "$CTX/$DEP"   # matches the ahead branch, not on main
+OUT=$(gitsync apply 2>&1)
+echo "$OUT" | grep -q 'SKIP (ahead)' && ok "C7: ahead copy skip-logged" || bad "C7: ahead not skip-logged"
+grep -q 'v3-ahead' "$CTX/$DEP" && ok "C7: ahead copy preserved (not clobbered)" || bad "C7: ahead copy was clobbered"
+rm -rf "$R"
+
+echo "== [C8] DIVERGED (manual edit) deployed copy → apply SKIPS =="
+gitcase; printf 'manual-founder-edit\n' > "$CTX/$DEP"   # matches no commit
+OUT=$(gitsync apply 2>&1)
+echo "$OUT" | grep -q 'SKIP (diverged)' && ok "C8: diverged copy skip-logged" || bad "C8: diverged not skip-logged"
+grep -q 'manual-founder-edit' "$CTX/$DEP" && ok "C8: manual edit preserved" || bad "C8: manual edit was clobbered"
+rm -rf "$R"
+
+echo "== [C9] --force overrides the guard → deliberate reconcile applies =="
+gitcase; printf 'manual-founder-edit\n' > "$CTX/$DEP"
+gitsync apply --force >/dev/null 2>&1
+grep -q 'v2-canonical' "$CTX/$DEP" && ok "C9: --force reconciles diverged to canonical" || bad "C9: --force did not apply"
+rm -rf "$R"
+
+echo "== [C10] MISSING deployed file → still synced (guard does not block restore) =="
+gitcase   # no deployed file written
+gitsync apply >/dev/null 2>&1
+grep -q 'v2-canonical' "$CTX/$DEP" 2>/dev/null && ok "C10: missing deployed file restored" || bad "C10: missing file not restored"
+rm -rf "$R"
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
