@@ -59,6 +59,40 @@ if [ -z "$REMOTE_SHA" ]; then
   exit 0
 fi
 
+# --- Re-divergence guard (SYS-REDIVERGENCE-01, R1-light) ---------------------
+# After the daemon-runtime→main convergence (task_1782743859024), daemon-runtime
+# is a FF-ONLY MIRROR of main: fleet hotfixes land via PR→main, then daemon-runtime
+# fast-forwards. The one gap in that model is discipline — a commit made straight
+# to daemon-runtime re-opens the drift+landmine engine R1-light exists to kill.
+# This guard surfaces that slip immediately: alert PD the instant the mirror branch
+# carries ANY commit origin/main lacks. Arms ONLY on the daemon-runtime mirror
+# branch; dedups on the ahead-tip sha so an unresolved slip pages once, not every
+# 10-min fire; clears its signature once the mirror is converged again. Independent
+# of the dist-lag check below (a branch can be commit-ahead even with current dist).
+SRC_WATCH_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
+if [ "$SRC_WATCH_BRANCH" = "daemon-runtime" ]; then
+  REDIV_STATE_DIR="${CTX_ROOT:-$HOME/.cortextos/default}/state"
+  REDIV_SIG_FILE="$REDIV_STATE_DIR/src-watch-redivergence.sig"
+  AHEAD_COUNT=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
+  if [ "${AHEAD_COUNT:-0}" -gt 0 ]; then
+    AHEAD_TIP=$(git rev-parse HEAD 2>/dev/null || echo "")
+    LAST_REDIV_SIG=$(cat "$REDIV_SIG_FILE" 2>/dev/null || echo "")
+    if [ "$AHEAD_TIP" != "$LAST_REDIV_SIG" ]; then
+      AHEAD_LIST=$(git log --oneline origin/main..HEAD 2>/dev/null | head -5 | tr '\n' ';' || true)
+      cortextos bus send-message platform-director high \
+        "[cortextos-src-watch] RE-DIVERGENCE: daemon-runtime is ${AHEAD_COUNT} commit(s) AHEAD of origin/main — R1-light discipline slip (committed straight to daemon-runtime instead of PR->main->FF). Re-converge: PR these to main, then fast-forward the mirror. Commits: ${AHEAD_LIST}" \
+        2>/dev/null || true
+      mkdir -p "$REDIV_STATE_DIR" 2>/dev/null || true
+      printf '%s' "$AHEAD_TIP" > "$REDIV_SIG_FILE" 2>/dev/null || true
+    else
+      echo "[cortextos-src-watch] re-divergence UNCHANGED (daemon-runtime +${AHEAD_COUNT} @ ${AHEAD_TIP:0:8}) — page deduped"
+    fi
+  else
+    # Mirror converged (0 ahead) — drop any stale signature so a future slip re-pages.
+    rm -f "$REDIV_SIG_FILE" 2>/dev/null || true
+  fi
+fi
+
 # Up-to-date if: origin/main is already an ancestor of BUILD_SHA (local HEAD is a merge
 # commit that includes origin/main), OR the two commits have byte-identical trees
 # (topology-only difference, e.g. squash-merge — no rebuild would change dist).
