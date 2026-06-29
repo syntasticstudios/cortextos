@@ -141,9 +141,33 @@ if [ -n "$REMOTE_SHA" ] && [ -n "$BUILD_SHA" ]; then
       FULL_DELTA=""
     fi
     if [ -n "$MAT_DELTA" ]; then
-      # DIST-affecting change → daemon rebuild needed → full page.
-      SOURCE_DRIFT="true"
-      REASONS+=("SOURCE: origin/main ${REMOTE_SHA:0:8} not contained in build ${BUILD_SHA:0:8} — $(fmt_delta_summary "$MAT_DELTA") dist-affecting (src/ + build config) — dist needs rebuild")
+      # Split the dist-affecting delta into daemon-PROCESS src vs out-of-process CLI/tooling
+      # src (SYS-DEPLOY-DRIFT-CLISPLIT, task_1782757548171). dist/daemon.js and dist/cli.js
+      # are SEPARATE tsup bundles; src/cli/** compiles ONLY into cli.js, which is invoked
+      # fresh per CLI call → once dist is rebuilt the CLI change is LIVE with NO daemon
+      # restart. So a CLI-only src advance must NOT page "daemon needs restart". Everything
+      # else under src/ (src/daemon, src/bus, src/hooks, src/utils, src/types) compiles INTO
+      # daemon.js → a running daemon keeps the old code until restarted → page.
+      # ASSUMPTION (verified 2026-06-29 w/ devops): src/daemon imports nothing from
+      # src/cli/** (only a comment ref), so no daemon.js code lives under src/cli. SAFETY
+      # NETS if a future src/daemon→src/cli import ever breaks the path heuristic: (a) the
+      # restart-hold mute below keys on the daemon.js CONTENT HASH, so such an import moves
+      # the hash and FIRES; (b) the content-based RESTART dimension is an independent
+      # backstop. So a mis-classified CLI change can never silently hide a daemon lag.
+      DAEMON_MAT=$(printf '%s\n' "$MAT_DELTA" | grep -v '^src/cli/' || true)
+      CLI_MAT=$(printf '%s\n' "$MAT_DELTA" | grep '^src/cli/' || true)
+      if [ -n "$DAEMON_MAT" ]; then
+        # Daemon-process src in the delta → daemon rebuild + restart needed → page.
+        SOURCE_DRIFT="true"
+        REASONS+=("SOURCE: origin/main ${REMOTE_SHA:0:8} not contained in build ${BUILD_SHA:0:8} — $(fmt_delta_summary "$DAEMON_MAT") daemon-process src (compiled into daemon.js) — dist needs rebuild + daemon restart")
+        [ -n "$CLI_MAT" ] && REASONS+=("SOURCE-CLI (info): delta also includes $(fmt_delta_summary "$CLI_MAT") CLI/tooling src — served per-invoke by the rebuilt binary, no daemon restart needed")
+      else
+        # CLI/tooling src ONLY (no daemon-process delta) → the rebuilt binary serves it →
+        # record-not-page (no daemon restart). Routed through SOURCE_INERT so DRIFT stays
+        # false on a cli-only advance (the #100-class "page on every CLI PR" false-page).
+        SOURCE_INERT="true"
+        REASONS+=("SOURCE-CLI: origin/main ${REMOTE_SHA:0:8} ahead of build ${BUILD_SHA:0:8} by $(fmt_delta_summary "$CLI_MAT") CLI/tooling src ONLY (src/cli/**) — served per-invoke by the rebuilt binary; dist rebuild updates the CLI, NO daemon restart needed; recorded, not paged")
+      fi
     elif [ -n "$OPS_DELTA" ]; then
       # No dist delta, but .github/workflows/** advanced — operationally material. Page
       # (NOT silenced) per PD SYS-DEPLOY-SOT spec; daemon rebuild is NOT required.
@@ -321,6 +345,35 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 # content rather than mtime. Best-effort — never block the probe.
 if [ -n "$NEW_FP" ]; then echo "$NEW_FP" > "$FINGERPRINT_FILE" 2>/dev/null || true; fi
 
+# --- 4b. Founder-gate restart-hold mute (SYS-DEPLOY-DRIFT-HOLDMUTE, task_1782757548171) ---
+# When the daemon-PROCESS restart is deliberately HELD (Founder-gated, ticketed — e.g. the
+# #95 housekeeping restart awaiting Founder OK), the daemon-process SOURCE + RESTART drift
+# is KNOWN/expected and must RECORD-not-page so it stops nagging PD on every material main
+# advance. The mute marker keys on (held_pid + the daemon.js CONTENT HASH at hold time):
+#   • running pid == held pid AND on-disk daemon.js hash == held hash → the SAME known held
+#     drift → mute active (record-not-page the daemon SOURCE/RESTART).
+#   • daemon.js hash MOVES (a new src/daemon|src/bus PR rebuilt into daemon.js, OR a future
+#     src/cli→daemon import) → hash mismatch → mute INACTIVE → the new daemon lag PAGES.
+#   • pid CHANGES (the held restart landed, or a crash-respawn) → marker stale → auto-clear
+#     + resume paging (the drift itself also resolves once the new pid loads current dist).
+# Non-daemon dimensions (deployed-drift, sha-stale, orphan) are NEVER muted. The content-
+# based RESTART dimension remains an independent backstop. Marker format (line 1):
+#   <held_pid>:<held_daemon_js_sha256>[:<ticket-or-note>]
+RESTART_HOLD_MUTE="false"
+HOLD_MUTE_FILE="$STATE_DIR/.deploy-drift-restart-hold"
+if [ -f "$HOLD_MUTE_FILE" ]; then
+  HM_PID=$(awk -F: 'NR==1{print $1}' "$HOLD_MUTE_FILE" 2>/dev/null)
+  HM_HASH=$(awk -F: 'NR==1{print $2}' "$HOLD_MUTE_FILE" 2>/dev/null)
+  if [ -n "$HM_PID" ] && [ "$HM_PID" != "$DAEMON_PID" ]; then
+    rm -f "$HOLD_MUTE_FILE" 2>/dev/null || true
+    log "restart-hold mute cleared: daemon pid changed ($HM_PID → $DAEMON_PID) — held restart resolved"
+  elif [ "$HM_PID" = "$DAEMON_PID" ] && [ -n "$HM_HASH" ] && [ "$HM_HASH" = "$DAEMON_HASH" ]; then
+    RESTART_HOLD_MUTE="true"
+  fi
+  # Same pid but daemon.js hash moved: leave the marker for the owner to refresh; mute stays
+  # FALSE so the new daemon-affecting drift pages (never silently hide a real daemon lag).
+fi
+
 TOPOLOGY_FILE="$STATE_DIR/deploy-topology.json"
 REASONS_JSON=$(printf '%s\n' "${REASONS[@]:-}" | python3 -c "import json,sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l]))" 2>/dev/null || echo "[]")
 DEPLOYED_DRIFT_JSON=$(printf '%s\n' "${DEPLOYED_DRIFT_FILES[@]:-}" | python3 -c "import json,sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l]))" 2>/dev/null || echo "[]")
@@ -343,6 +396,7 @@ cat > "$TOPOLOGY_FILE" <<EOF
   "source_inert": $SOURCE_INERT,
   "restart_drift": $RESTART_DRIFT,
   "restart_hold": $RESTART_HOLD,
+  "restart_hold_mute": $RESTART_HOLD_MUTE,
   "hold_tokens": $HOLD_TOKENS_JSON,
   "sha_stale": $SHA_STALE,
   "deployed_drift": $DEPLOYED_DRIFT,
@@ -395,10 +449,24 @@ if [ "$SOURCE_DRIFT" = "true" ] && declare -f source_drift_sig >/dev/null 2>&1; 
   SOURCE_SIG=$(source_drift_sig "$FRAMEWORK_ROOT" "$BUILD_SHA" "$REMOTE_SHA")
 fi
 
-DRIFT_KEY="src=${SOURCE_DRIFT};srcsig=${SOURCE_SIG};sha=${SHA_STALE};pid=${DAEMON_PID};dep=${DEPLOYED_SIG};hold=${RESTART_HOLD}"
+DRIFT_KEY="src=${SOURCE_DRIFT};srcsig=${SOURCE_SIG};sha=${SHA_STALE};pid=${DAEMON_PID};dep=${DEPLOYED_SIG};hold=${RESTART_HOLD};holdmute=${RESTART_HOLD_MUTE}"
 LAST_KEY=$(cat "$MARKER" 2>/dev/null || echo "")
 
-if [ "$DRIFT" = "true" ]; then
+# Restart-hold mute (section 4b): while the held daemon-process restart is Founder-gated
+# (pid + daemon.js hash matched), the daemon SOURCE/RESTART drift is expected → page ONLY
+# if a NON-held dimension (deployed-drift / sha-stale / orphan) also drifted. A daemon.js
+# hash move or pid change already flips RESTART_HOLD_MUTE=false (4b) so a genuinely-new
+# daemon lag or a real restart always pages. Topology artifact records everything regardless.
+PAGE_DRIFT="$DRIFT"
+if [ "$RESTART_HOLD_MUTE" = "true" ]; then
+  if [ "$DEPLOYED_DRIFT" = "true" ] || [ "$DEPLOYED_ORPHAN" = "true" ] || [ "$SHA_STALE" = "true" ]; then
+    PAGE_DRIFT="true"
+  else
+    PAGE_DRIFT="false"
+  fi
+fi
+
+if [ "$PAGE_DRIFT" = "true" ]; then
   for r in "${REASONS[@]}"; do log "DRIFT: $r"; done
   if [ "$DRIFT_KEY" != "$LAST_KEY" ]; then
     SUMMARY=$(printf '%s; ' "${REASONS[@]}")
@@ -415,6 +483,13 @@ if [ "$DRIFT" = "true" ]; then
   else
     log "drift unchanged since last fire — escalation suppressed (idempotent)"
   fi
+elif [ "$DRIFT" = "true" ]; then
+  # Drift present but page-suppressed by the Founder-gate restart-hold mute (only the known
+  # held daemon-process SOURCE/RESTART, pid+daemon.js-hash matched). Record, do NOT page,
+  # and do NOT touch the marker — so when the mute clears (pid or daemon.js hash changes) the
+  # then-current key differs from $LAST_KEY and the next material change re-pages cleanly.
+  for r in "${REASONS[@]}"; do log "DRIFT(hold-muted): $r"; done
+  log "restart-hold mute ACTIVE (pid $DAEMON_PID + daemon.js hash matched) — daemon SOURCE/RESTART recorded, not paged"
 else
   log "no drift: origin/main ⊆ build, daemon running current on-disk build"
   [ -f "$MARKER" ] && rm -f "$MARKER" && log "cleared prior drift marker (recovered)"
