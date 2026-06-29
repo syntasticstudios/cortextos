@@ -75,16 +75,27 @@ All thresholds live at the top of each script as shell variables — open the sc
 ## Authoring convention — schedule/interval parsing (single source of truth)
 
 Any out-of-process monitor here that resolves a cron INTERVAL (e.g. to derive a per-agent
-staleness threshold) MUST match the canonical daemon parser `parseDurationMs`
-(`src/bus/cron-state.js`): handle the duration SHORTHANDS `Nh` / `Nmin` / `Nd` / bare-int-minutes
-**and** 5-field cron exprs — and be tested against representative values. In-process daemon (TS)
-consumers already share `parseDurationMs`; out-of-process scripts (bash/python) RE-IMPLEMENT it and
-silently drift, which is the actual risk surface when a new schedule format is introduced. A
-5-field-only parser falls back to a generic floor on a `4h` shorthand → false-positive (see the
-2026-06-28 cannametrics false-stale: cadence moved 30min→`4h`, parser returned None → WARN floor 90
-→ false alert). Reference impl: `cron_interval_minutes` + `_shorthand_minutes` in
-`fleet-heartbeat-advance-watch.sh` (commit db19f5ac). Future: a `cortextos cron parse-interval`
-CLI subcommand would let scripts CALL the canonical parser instead of re-implementing.
+staleness threshold) MUST resolve it through the canonical daemon parser instead of
+re-implementing the shorthand/cron-expr logic. The class-killer for the drift is the CLI:
+
+```sh
+# minutes (default) — shorthand or 5-field cron expr, same parser the daemon uses
+MIN=$(cortextos cron parse-interval '4h')          # -> 240
+MIN=$(cortextos cron parse-interval '*/15 * * * *')  # -> 15
+MS=$(cortextos cron parse-interval '30m' --unit ms)  # -> 1800000
+# exits non-zero on unparseable input (does NOT silently floor to a fallback)
+```
+
+`cron parse-interval` wraps `parseDurationMs` + `cronExpressionMinIntervalMs`
+(`src/bus/cron-state.ts`) — handles the duration SHORTHANDS `Nm` / `Nh` / `Nd` / `Nw` **and**
+5-field cron exprs. In-process daemon (TS) consumers already share `parseDurationMs`; the historical
+risk was out-of-process scripts (bash/python) RE-IMPLEMENTING it and silently drifting when a new
+schedule format was introduced. A 5-field-only re-impl falls back to a generic floor on a `4h`
+shorthand → false-positive (see the 2026-06-28 cannametrics false-stale: cadence moved 30min→`4h`,
+parser returned None → WARN floor 90 → false alert). **New scripts MUST call
+`cortextos cron parse-interval` rather than re-implement interval parsing.** Legacy reference impl:
+`cron_interval_minutes` + `_shorthand_minutes` in `fleet-heartbeat-advance-watch.sh` (commit
+db19f5ac) — migrate it to the CLI when next touched.
 
 ## Caveats
 
