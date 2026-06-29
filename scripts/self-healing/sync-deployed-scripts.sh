@@ -26,10 +26,15 @@ set -uo pipefail
 
 MODE="check"
 FROM_WORKTREE=0
+FORCE=0
 for arg in "$@"; do
   case "$arg" in
     check|apply) MODE="$arg" ;;
     --from-worktree) FROM_WORKTREE=1 ;;
+    # Deliberate-operator override: apply even over an AHEAD/DIVERGED (manual-edit) deployed
+    # copy. The automated path (src-watch bare `apply`) must NOT pass this, so an unmerged
+    # or Founder-hand-edited deployed copy is never silently clobbered (SYS-DEPLOY-SYNC-DIRGUARD).
+    --force|--allow-diverged) FORCE=1 ;;
     *) echo "[sync-deployed-scripts] unknown arg: $arg" >&2; exit 64 ;;
   esac
 done
@@ -55,8 +60,33 @@ fi
 
 hash_of() { shasum -a 256 2>/dev/null | awk '{print $1}'; }
 
+# deploy_direction <dep_path> <sot> — classify the deployed copy vs origin/main:<sot> by
+# git-blob ancestry (mirrors the deploy-drift-probe #99 direction logic). Echoes:
+#   behind   — deployed content matches a commit that IS an ancestor of origin/main
+#              → genuinely stale; safe to sync canonical down (the normal purpose).
+#   ahead    — matches a commit NOT contained in origin/main → carries unmerged content.
+#   diverged — matches NO commit for this path → a manual / hand edit (e.g. a Founder guard).
+#   unknown  — cannot resolve (no deployed file / no blob).
+# Bounded cost: registry SoTs are small scripts with modest history; breaks on first match.
+deploy_direction() {
+  local dep_path="$1" sot="$2" dep_blob match _c _cb
+  dep_blob="$(git -C "$REPO_ROOT" hash-object "$dep_path" 2>/dev/null || echo "")"
+  [ -z "$dep_blob" ] && { echo "unknown"; return; }
+  match="$(git -C "$REPO_ROOT" rev-list --all -- "$sot" 2>/dev/null | while read -r _c; do
+    _cb="$(git -C "$REPO_ROOT" rev-parse --quiet --verify "$_c:$sot" 2>/dev/null)" || continue
+    if [ "$_cb" = "$dep_blob" ]; then echo "$_c"; break; fi
+  done)"
+  [ -z "$match" ] && { echo "diverged"; return; }
+  if git -C "$REPO_ROOT" merge-base --is-ancestor "$match" origin/main 2>/dev/null; then
+    echo "behind"
+  else
+    echo "ahead"
+  fi
+}
+
 DRIFT=0
 APPLY_FAIL=0
+SKIPPED_DIVERGED=0
 
 # Read the registry: strip comments/blank lines, split on the pipe.
 while IFS='|' read -r dep sot; do
@@ -93,6 +123,21 @@ while IFS='|' read -r dep sot; do
   SRC_REF=$( [ "$FROM_WORKTREE" -eq 1 ] && echo worktree || echo origin/main )
   DEP_SHOW="${DEP_HASH:0:12}"; [ -z "$DEP_HASH" ] && DEP_SHOW="missing"
   log "DRIFT: $dep ($DEP_SHOW) != ${sot}@${SRC_REF} (${SRC_HASH:0:12})"
+
+  # Direction guard (SYS-DEPLOY-SYNC-DIRGUARD): on the AUTOMATED origin/main path, never
+  # auto-clobber a deployed copy that is AHEAD (carries unmerged content — would revert it,
+  # the morning #96-guard near-miss) or DIVERGED (a manual / Founder hand edit — would
+  # silently overwrite it before a human rules). Warn + SKIP instead. --force / --from-worktree
+  # are deliberate operator actions and bypass the guard so the eventual sanctioned re-converge
+  # is never blocked. A genuinely BEHIND (stale) copy, or a missing deployed file, still syncs.
+  if [ "$MODE" = "apply" ] && [ "$FORCE" -eq 0 ] && [ "$FROM_WORKTREE" -eq 0 ] && [ -n "$DEP_HASH" ]; then
+    DIR="$(deploy_direction "$DEP_PATH" "$sot")"
+    if [ "$DIR" = "ahead" ] || [ "$DIR" = "diverged" ]; then
+      SKIPPED_DIVERGED=1
+      log "  -> SKIP ($DIR): $dep is $DIR vs origin/main:$sot — NOT auto-clobbering a manual/unmerged edit. Re-run with --force for a deliberate reconcile."
+      continue
+    fi
+  fi
 
   if [ "$MODE" = "apply" ]; then
     mkdir -p "$(dirname "$DEP_PATH")" 2>/dev/null || true
