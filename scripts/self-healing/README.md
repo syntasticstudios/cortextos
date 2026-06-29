@@ -72,6 +72,20 @@ All thresholds live at the top of each script as shell variables — open the sc
 ### `usage-monitor.sh`
 - `YELLOW_THRESHOLD` (default `15`) and `RED_THRESHOLD` (default `30`) — USD/hr tier boundaries
 
+## Authoring convention — schedule/interval parsing (single source of truth)
+
+Any out-of-process monitor here that resolves a cron INTERVAL (e.g. to derive a per-agent
+staleness threshold) MUST match the canonical daemon parser `parseDurationMs`
+(`src/bus/cron-state.js`): handle the duration SHORTHANDS `Nh` / `Nmin` / `Nd` / bare-int-minutes
+**and** 5-field cron exprs — and be tested against representative values. In-process daemon (TS)
+consumers already share `parseDurationMs`; out-of-process scripts (bash/python) RE-IMPLEMENT it and
+silently drift, which is the actual risk surface when a new schedule format is introduced. A
+5-field-only parser falls back to a generic floor on a `4h` shorthand → false-positive (see the
+2026-06-28 cannametrics false-stale: cadence moved 30min→`4h`, parser returned None → WARN floor 90
+→ false alert). Reference impl: `cron_interval_minutes` + `_shorthand_minutes` in
+`fleet-heartbeat-advance-watch.sh` (commit db19f5ac). Future: a `cortextos cron parse-interval`
+CLI subcommand would let scripts CALL the canonical parser instead of re-implementing.
+
 ## Caveats
 
 - Only tested on macOS (launchd). A cron-based variant for Linux is straightforward — feel free to PR.

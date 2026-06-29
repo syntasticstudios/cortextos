@@ -1,0 +1,12 @@
+{
+  "effective_date": "2026-06-28",
+  "currency": "USD",
+  "per_million_tokens": {
+    "opus":   {"input": 5,  "output": 25, "cache_read": 0.50, "cache_write_5m": 6.25,  "cache_write_1h": 10.00},
+    "sonnet": {"input": 3,  "output": 15, "cache_read": 0.30, "cache_write_5m": 3.75,  "cache_write_1h": 6.00},
+    "haiku":  {"input": 1,  "output": 5,  "cache_read": 0.10, "cache_write_5m": 1.25,  "cache_write_1h": 2.00},
+    "fable":  {"input": 10, "output": 50, "cache_read": 1.00, "cache_write_5m": 12.50, "cache_write_1h": 20.00}
+  },
+  "match": "model-id substring -> opus|sonnet|haiku|fable, fallback opus",
+  "source": "Anthropic public pricing (claude-api skill, cached 2026-06-04, verified 2026-06-28). cache_read = 0.1x input; cache_write_5m (5m TTL) = 1.25x input; cache_write_1h (1h TTL) = 2.0x input."
+}

@@ -44,6 +44,16 @@ fi
 
 SECRETS_ENV="$FRAMEWORK_ROOT/orgs/$ORG/secrets.env"
 
+# --- GUARD: API-key auth makes OAuth refresh obsolete AND harmful (founder 2026-06-28) ---
+# When the org authenticates via ANTHROPIC_API_KEY, re-injecting CLAUDE_CODE_OAUTH_TOKEN
+# here is destructive: a failed refresh writes a STALE token that resumed PTY sessions
+# prefer over the valid API key → fleet-wide "401 Invalid authentication" crash-loop →
+# watchdog-restart storm → daily-crash-cap HALT. Skip entirely while an API key is in use.
+if [ -f "$SECRETS_ENV" ] && grep -qE '^ANTHROPIC_API_KEY=.' "$SECRETS_ENV"; then
+  log "ANTHROPIC_API_KEY present in $SECRETS_ENV — OAuth refresh disabled (API-key auth). SKIP."
+  exit 0
+fi
+
 # --- Read Keychain ---
 CREDS_JSON=$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null || true)
 if [ -z "$CREDS_JSON" ]; then

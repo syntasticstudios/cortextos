@@ -38,39 +38,60 @@
 #   (the reciprocal note lives in wedge-watchdog holdAlertGate). A hidden cross-monitor
 #   coverage dependency is itself a masking-class risk; the coupling is documented on BOTH sides.
 #
-# THRESHOLDS (grounded in the DEMONSTRATED incident, lenient-by-design):
-#   The backstop targets the daemon-restart-stall CLASS — which manifests as HOURS
-#   of non-ticking (today: 4-6h). It is NOT a tight per-agent liveness monitor.
-#   Thresholds are deliberately generous so they NEVER false-fire on a legitimately
-#   slow-heartbeating agent: testing 2026-06-17 showed user-proxy (passive Founder
-#   auto-responder) at 56min while healthy — a 30min ALERT would have cried wolf on
-#   it. So:
-#   WARN  >90min  — well beyond any normal cadence incl. passive agents; soft heads-up
-#   ALERT >180min — ~3h; catches the 4-6h daemon-stall class with margin (PD can
-#                   nudge at 3h before it drags to 6h) without ever firing on a
-#                   slow-but-healthy agent.
-#   REFINEMENT (noted, not built): per-agent thresholds keyed to each agent's actual
-#   configured heartbeat interval would tighten detection (esp. for the 4min coding
-#   agents) without false-firing on passive ones. Universal-generous is the safe v1.
+# THRESHOLDS (PER-AGENT, interval-aware — SYS-WATCHDOG-CAL 2026-06-28):
+#   The fleet's heartbeat-cron intervals are 6x non-uniform: 5 HEAVY agents
+#   (backend-architect/cortextos-improver/frontend-dev/platform-director/
+#   systems-analyst) heartbeat every 4h ("M */4" -> 240min backstop), 3 agents
+#   (cannametrics-data/integrations-routing/product-owner) every 30min ("M1,M2 *"),
+#   and 2 (devops-monitor/user-proxy) hourly ("M *" -> 60min). A UNIVERSAL threshold
+#   cannot fit all: WARN150 sat BELOW the heavy-5's own 240min backstop, so an
+#   idle-but-ALIVE heavy agent legitimately ages to ~240min and false-WARNs in the
+#   150-240 gap BEFORE its backstop refreshes (the 2026-06-28 synchronized-idle
+#   false-WARN: PD/SA/BA/FE finished a burst ~18:42, went idle in lockstep, all 4
+#   aged toward 240min together). Activity-suppression (below) does NOT cover this:
+#   a genuinely-IDLE-but-alive agent produces no work to corroborate, and the
+#   suppression window (= the tripped universal threshold) is shorter than the 240min
+#   backstop. Idle-alive is a distinct case from busy-mid-turn.
 #
-# Run:  bash scripts/fleet-heartbeat-advance-watch.sh   (read-only; bus-store)
-# Exit: 0 = all agents fresh (<WARN)                 — no fire
-#       1 = >=1 agent at ALERT (>30min)              — route ALERT to PD lane
-#       3 = WARN-only (>15min, none at ALERT)        — soft heads-up to PD lane
-#       2 = probe error (list-agents empty/unreadable) — probe-blind, do NOT fire
+#   So each agent's thresholds are now KEYED TO ITS OWN configured heartbeat interval
+#   (read from config.json crons[name=heartbeat].cron):
+#     interval = max consecutive gap (min) between fires of that cron expr
+#     WARN_agent  = max(WARN_FLOOR=90,  interval + WARN_MARGIN=60)
+#     ALERT_agent = max(ALERT_FLOOR=150, ceil(interval * ALERT_FACTOR=1.5))
+#   Effect: heavy-5 -> WARN300/ALERT360 (never false-WARN on 4h-idle; their own
+#   backstop is 240min so detection cannot be tighter than that by construction);
+#   30min agents -> WARN90/ALERT150 (FASTER detection than the old universal 150/210);
+#   hourly -> WARN120/ALERT150. The FLOORS preserve the daemon-restall (4-6h) catch
+#   for EVERY agent: ALERT still fires on a real long stall (the cross-monitor coupling
+#   below is therefore intact — raising thresholds upward never disables that
+#   detection; the wedge holdAlertGate partition needs no reciprocal change).
+#   Agents whose config/heartbeat-cron can't be read fall back to the universal
+#   WARN_FLOOR/ALERT_FLOOR (safe-generous), logged as [fallback] on their line.
+#
+# Run:  bash scripts/self-healing/fleet-heartbeat-advance-watch.sh  (read-only; bus-store)
+# Exit: 0 = all agents below their per-agent WARN threshold      — no fire
+#       1 = >=1 agent past its per-agent ALERT threshold         — route ALERT to PD lane
+#       3 = WARN-only (>=1 past per-agent WARN, none at ALERT)   — soft heads-up to PD lane
+#       2 = probe error (list-agents empty/unreadable)           — probe-blind, do NOT fire
 set -euo pipefail
 
-# Thresholds raised to be SAFE for the slowest-legitimate heartbeat interval in the
-# fleet: agents do NOT all heartbeat every ~4min — user-proxy (passive Founder
-# auto-responder) heartbeats HOURLY ("38 * * * *"), so it normally reaches ~60-90min
-# between ticks. WARN90 false-fired it 2026-06-17 (91min, healthy, just ticked 21:38).
-# WARN150/ALERT210 sit above any normal interval incl. hourly+jitter, while still
-# catching the daemon-restall incident class (today's was 4-6h » 210min). The proper
-# refinement (noted, not built) is PER-AGENT interval-aware thresholds (read each
-# agent's heartbeat-cron interval, set threshold = N x its interval) — that would
-# restore fast-detection for the 4min agents without false-firing the hourly ones.
-WARN_MIN="${FLEET_HB_WARN_MIN:-150}"
-ALERT_MIN="${FLEET_HB_ALERT_MIN:-210}"
+# PER-AGENT interval-aware threshold parameters (SYS-WATCHDOG-CAL). Each agent's
+# WARN/ALERT is derived from its OWN heartbeat-cron interval (see header). The FLOORS
+# are the daemon-restall safety net (every agent ALERTs on a real long stall) and the
+# fallback for agents whose config can't be read. All env-overridable for tuning/tests.
+#   WARN_FLOOR   — no agent WARNs below this even if its interval is tiny (generous-safe)
+#   ALERT_FLOOR  — no agent ALERTs below this; catches the 4-6h daemon-restall class
+#   WARN_MARGIN  — added to interval for WARN (covers cron jitter/stagger above interval)
+#   ALERT_FACTOR — interval multiplier for ALERT (a real stall sails past N x interval)
+WARN_FLOOR_MIN="${FLEET_HB_WARN_FLOOR_MIN:-90}"
+ALERT_FLOOR_MIN="${FLEET_HB_ALERT_FLOOR_MIN:-150}"
+WARN_MARGIN_MIN="${FLEET_HB_WARN_MARGIN_MIN:-60}"
+ALERT_FACTOR="${FLEET_HB_ALERT_FACTOR:-1.5}"
+# Config root holding orgs/<org>/agents/<name>/config.json (heartbeat-cron source).
+# Prefer $CTX_FRAMEWORK_ROOT; else derive from this script's location (scripts/self-healing/
+# -> framework root is two dirs up) so it stays correct under re-clone/relocation.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_ROOT="${CTX_FRAMEWORK_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
 # ADVANCE-DELTA state: persist each agent's last_heartbeat between fires so a FROZEN
 # agent (last_heartbeat NOT advancing across a cycle) is caught within ONE cycle,
@@ -80,7 +101,7 @@ ALERT_MIN="${FLEET_HB_ALERT_MIN:-210}"
 # flags it immediately. A genuinely-slow-but-healthy agent (e.g. passive user-proxy)
 # still ADVANCES within a cycle, so it won't trip FROZEN. FROZEN is WARN-level (soft),
 # not a hard page, to stay safe against any unusually-slow-but-healthy interval.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# (SCRIPT_DIR defined above, alongside CONFIG_ROOT.)
 # Runtime state lives in CTX_ROOT/state (outside the repo) — never next to the tracked
 # script, so relocating into scripts/self-healing/ produces zero tracked churn.
 STATE_FILE="${FLEET_HB_STATE_FILE:-${CTX_ROOT:-$HOME/.cortextos/default}/state/.fleet-hb-prev-state.json}"
@@ -125,13 +146,131 @@ trap 'rm -f "$TASKS_FILE"' EXIT
 cortextos bus list-tasks --format json > "$TASKS_FILE" 2>/dev/null || echo '[]' > "$TASKS_FILE"
 
 CTX_BASE="${CTX_ROOT:-$HOME/.cortextos/${CTX_INSTANCE_ID:-default}}"
-WARN_MIN="$WARN_MIN" ALERT_MIN="$ALERT_MIN" RAW="$RAW" TASKS_FILE="$TASKS_FILE" STATE_FILE="$STATE_FILE" CTX_BASE="$CTX_BASE" python3 - <<'PY'
-import json, os, sys, datetime
+WARN_FLOOR_MIN="$WARN_FLOOR_MIN" ALERT_FLOOR_MIN="$ALERT_FLOOR_MIN" WARN_MARGIN_MIN="$WARN_MARGIN_MIN" ALERT_FACTOR="$ALERT_FACTOR" CONFIG_ROOT="$CONFIG_ROOT" RAW="$RAW" TASKS_FILE="$TASKS_FILE" STATE_FILE="$STATE_FILE" CTX_BASE="$CTX_BASE" python3 - <<'PY'
+import json, os, sys, datetime, glob, math
 
-warn_m = float(os.environ["WARN_MIN"])
-alert_m = float(os.environ["ALERT_MIN"])
+# PER-AGENT interval-aware thresholds (SYS-WATCHDOG-CAL). Floors/margin/factor are the
+# knobs; each agent's WARN/ALERT is derived from its own heartbeat-cron interval below.
+warn_floor = float(os.environ["WARN_FLOOR_MIN"])
+alert_floor = float(os.environ["ALERT_FLOOR_MIN"])
+warn_margin = float(os.environ["WARN_MARGIN_MIN"])
+alert_factor = float(os.environ["ALERT_FACTOR"])
+config_root = os.environ.get("CONFIG_ROOT", "")
 state_file = os.environ["STATE_FILE"]
 now = datetime.datetime.now(datetime.timezone.utc)
+
+def _expand_cron_field(field, lo, hi):
+    """Expand one cron field to a sorted set of ints in [lo,hi]. Supports *, */N,
+    a-b, a-b/N, comma-lists, and single values. Raises on anything unparseable."""
+    out = set()
+    for part in field.split(","):
+        step = 1
+        if "/" in part:
+            base, step_s = part.split("/", 1)
+            step = int(step_s)
+        else:
+            base = part
+        if base == "*":
+            start, end = lo, hi
+        elif "-" in base:
+            s, e = base.split("-", 1)
+            start, end = int(s), int(e)
+        else:
+            start = end = int(base)
+        for v in range(start, end + 1, step):
+            if lo <= v <= hi:
+                out.add(v)
+    if not out:
+        raise ValueError("empty field")
+    return sorted(out)
+
+def _shorthand_minutes(expr):
+    """Parse a duration SHORTHAND like '4h','30min','90m','2hr','1d','240' -> minutes.
+    The daemon/config accept BOTH 5-field cron exprs AND these shorthands (a cadence
+    change can rewrite '7,37 * * * *' to '4h'); the 5-field parser returns None on a
+    shorthand -> false fallback to the WARN floor. Handling the shorthand here keys the
+    threshold to the TRUE cadence, so a cadence-LENGTHENING change (30min->4h) no longer
+    leaves a false-overdue window. None if not a recognised shorthand."""
+    s = expr.strip().lower()
+    if not s:
+        return None
+    if s.isdigit():            # bare integer = minutes (matches update-cron-fire --interval)
+        return int(s)
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    if i == 0:
+        return None
+    num = int(s[:i])
+    unit = s[i:].strip()
+    if unit in ("h", "hr", "hrs", "hour", "hours"):
+        return num * 60
+    if unit in ("m", "min", "mins", "minute", "minutes"):
+        return num
+    if unit in ("d", "day", "days"):
+        return num * 1440
+    if unit in ("s", "sec", "secs", "second", "seconds"):
+        return max(1, num // 60)
+    return None
+
+def cron_interval_minutes(expr):
+    """Max consecutive gap (minutes) between fires of a heartbeat schedule. Accepts a
+    duration SHORTHAND ('4h','30min',...) OR a 5-field cron expr. For a cron expr this is
+    the LONGEST an agent legitimately goes silent between ticks, so thresholds derived
+    from it never false-fire on the slow side. Returns None if neither form parses or the
+    expr constrains day/month/dow (not a pure intraday cron)."""
+    sh = _shorthand_minutes(expr)
+    if sh is not None:
+        return sh
+    parts = expr.split()
+    if len(parts) < 5:
+        return None
+    minute, hour, dom, mon, dow = parts[0], parts[1], parts[2], parts[3], parts[4]
+    # Only handle pure intraday recurrence (dom/mon/dow unrestricted); anything else
+    # falls back to floors rather than guessing.
+    if dom != "*" or mon != "*" or dow != "*":
+        return None
+    try:
+        minutes = _expand_cron_field(minute, 0, 59)
+        hours = _expand_cron_field(hour, 0, 23)
+    except Exception:
+        return None
+    fires = sorted(h * 60 + m for h in hours for m in minutes)
+    if not fires:
+        return None
+    if len(fires) == 1:
+        return 1440  # once per day
+    gaps = [fires[i + 1] - fires[i] for i in range(len(fires) - 1)]
+    gaps.append(fires[0] + 1440 - fires[-1])  # wrap across midnight
+    return max(gaps)
+
+def agent_heartbeat_interval(name):
+    """Read name's heartbeat-cron interval (min) from its config.json. None if the
+    config or heartbeat cron can't be found/parsed -> caller uses the floor fallback."""
+    if not config_root:
+        return None
+    for cfg_path in glob.glob(os.path.join(config_root, "orgs", "*", "agents", name, "config.json")):
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except Exception:
+            continue
+        for c in cfg.get("crons", []):
+            if (c.get("name", "").lower() == "heartbeat") and c.get("cron"):
+                iv = cron_interval_minutes(c["cron"])
+                if iv is not None:
+                    return iv
+    return None
+
+def thresholds_for(name):
+    """(warn_min, alert_min, mode) for an agent. Interval-aware when its heartbeat
+    cron is readable; floors otherwise (mode='fallback')."""
+    iv = agent_heartbeat_interval(name)
+    if iv is None:
+        return warn_floor, alert_floor, "fallback"
+    warn_a = max(warn_floor, iv + warn_margin)
+    alert_a = max(alert_floor, math.ceil(iv * alert_factor))
+    return warn_a, alert_a, f"interval={iv}min"
 
 try:
     data = json.loads(os.environ["RAW"])
@@ -230,6 +369,10 @@ for ag in agents:
         lines.append(f"  {name}: unparseable last_heartbeat '{hb}' -> skip")
         continue
     new_readings[name] = hb
+    # PER-AGENT interval-aware thresholds (SYS-WATCHDOG-CAL): keyed to THIS agent's own
+    # heartbeat-cron interval so an idle-but-alive heavy agent (240min backstop) never
+    # false-WARNs in the old 150-240 gap, while fast agents get tighter detection.
+    warn_m, alert_m, mode = thresholds_for(name)
     # FROZEN = last_heartbeat did NOT advance since the prev fire (zero-advance).
     frozen = name in prev and prev[name] == hb
     # Candidate status = ABSOLUTE staleness only. advance-delta "frozen" is DEMOTED to
@@ -263,7 +406,7 @@ for ag in agents:
             note = (f" -> SUPPRESSED busy (work-produced {live_age_m:.0f}min ago, "
                     f"within the {threshold_for:.0f}min window — busy-not-frozen)")
             status, bucket = "BUSY", None  # alive within the staleness window: do not alert
-    lines.append(f"  {name}: hb {age_m:.0f}min old (WARN>{warn_m:.0f}, ALERT>{alert_m:.0f}) -> {status}{note}")
+    lines.append(f"  {name}: hb {age_m:.0f}min old (WARN>{warn_m:.0f}, ALERT>{alert_m:.0f}; {mode}) -> {status}{note}")
     if bucket is not None:
         bucket.append({"agent": name, "hbAgeMin": round(age_m), "status": status,
                        "reason": "absolute_alert" if status == "ALERT" else "absolute_warn",
@@ -281,15 +424,18 @@ print("FLEET-HB-WATCH (bus-store last_heartbeat, restart-durable, advance-delta 
 print("\n".join(lines))
 
 if alerts:
-    print(f"\nALERT — route to PD lane (heartbeat stalled >{alert_m:.0f}min; PD triages "
+    print("\nALERT — route to PD lane (heartbeat stalled past the agent's per-agent "
+          "interval-aware ALERT threshold [see each entry's 'threshold']; PD triages "
           "nudge [sev-1 false-stale] then reap+cold-restart [sev-2 hung] per runbook):")
     print(json.dumps(alerts, indent=2))
     sys.exit(1)
 if warns:
-    print(f"\nWARN — soft heads-up to PD lane (FROZEN = hb did not advance since last fire = "
-          f"cron-stopped, caught in one cycle regardless of age; or absolute >{warn_m:.0f}min):")
+    print("\nWARN — soft heads-up to PD lane (FROZEN = hb did not advance since last fire = "
+          "cron-stopped, caught in one cycle regardless of age; or absolute-stale past the "
+          "agent's per-agent WARN threshold [see each entry's 'threshold']):")
     print(json.dumps(warns, indent=2))
     sys.exit(3)
-print(f"\nAll enabled agents heartbeating fresh (<{warn_m:.0f}min) + advancing — fleet tick healthy.")
+print("\nAll enabled agents heartbeating fresh (below their per-agent interval-aware WARN "
+      "thresholds) + advancing — fleet tick healthy.")
 sys.exit(0)
 PY
