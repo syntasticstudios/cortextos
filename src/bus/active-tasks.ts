@@ -39,7 +39,10 @@ function sortForBoard(a: Task, b: Task): number {
   const pb = PRIORITY_RANK[b.priority] ?? 9;
   if (pa !== pb) return pa - pb;
   // Most recently touched first within a priority band.
-  return (b.updated_at || '').localeCompare(a.updated_at || '');
+  // Coerce to String: a numeric updated_at (e.g. Date.now() written instead of
+  // toISOString()) would otherwise crash with ".localeCompare is not a function"
+  // and freeze the whole board (founder 2026-06-29).
+  return String(b.updated_at || '').localeCompare(String(a.updated_at || ''));
 }
 
 function table(tasks: Task[], dateField: 'updated_at' | 'created_at'): string {
@@ -53,7 +56,10 @@ function table(tasks: Task[], dateField: 'updated_at' | 'created_at'): string {
   const rows = tasks.map((t) => {
     const bundle = (t as { bundle_id?: string }).bundle_id;
     const title = bundle ? `${cell(t.title)} _(bundle: ${cell(bundle)})_` : cell(t.title);
-    const when = (t[dateField] || '').replace('T', ' ').replace(/\..*$/, '');
+    // String()-coerce: a corrupt numeric timestamp (Date.now() instead of
+    // toISOString()) would otherwise crash .replace and freeze the board —
+    // same defense as sortForBoard above (founder 2026-06-29).
+    const when = String(t[dateField] || '').replace('T', ' ').replace(/\..*$/, '');
     return `| ${cell(t.id)} | ${cell(t.assigned_to)} | ${t.priority} | ${title} | ${when} |`;
   });
   return [header, sep, ...rows].join('\n');

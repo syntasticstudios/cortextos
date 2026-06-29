@@ -102,6 +102,18 @@ describe('active-tasks board renderer', () => {
     expect(md).toContain(`generated: ${NOW}`);
     expect(md).toContain(`Last render: ${NOW}`);
   });
+
+  it('does not throw when a task has a numeric updated_at (corrupt-write defense)', () => {
+    // A bad writer once stored Date.now() (a number) instead of toISOString().
+    // The sort comparator must coerce to String so localeCompare never blows up
+    // and freezes the whole board for every agent (founder 2026-06-29).
+    const bad = { ...mkTask({ id: 'numts', status: 'in_progress' }), updated_at: 1782699632739 as unknown as string };
+    const good = mkTask({ id: 'isots', status: 'in_progress', updated_at: '2026-06-29T02:20:00Z' });
+    expect(() => renderActiveTasksBoard([bad, good], NOW)).not.toThrow();
+    const md = renderActiveTasksBoard([bad, good], NOW);
+    expect(md).toContain('numts');
+    expect(md).toContain('isots');
+  });
 });
 
 describe('writeActiveTasksBoard', () => {
