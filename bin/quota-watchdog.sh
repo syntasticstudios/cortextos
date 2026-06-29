@@ -47,6 +47,22 @@ export CTX_ROOT CTX_FRAMEWORK_ROOT CTX_ORG
 export CTX_AGENT_NAME="$BUS_AGENT"
 export CTX_AGENT_DIR="$CTX_FRAMEWORK_ROOT/orgs/$CTX_ORG/agents/$BUS_AGENT"
 
+# --- API-key auth guard (SYS-AUTH-APIKEY-01) ---
+# When the org authenticates via ANTHROPIC_API_KEY there is no subscription
+# "remaining %" to read: the OAuth subscription-usage endpoint this watchdog
+# depends on needs an OAuth/Keychain token that no longer exists, so it reads
+# 0% and false-trips a fleet-wide pause with no auto-resume (incident
+# 2026-06-29 05:24 — method=api remaining=0% stopped all 10 agents, fleet hung).
+# Under API-key auth spend is bounded by the Anthropic Console hard spend-limit
+# instead, so the watchdog must skip entirely — same guard as
+# keychain-oauth-refresh.sh. Env override QUOTA_WATCHDOG_FORCE=1 bypasses it.
+SECRETS_ENV="${QUOTA_WATCHDOG_SECRETS_ENV:-$CTX_FRAMEWORK_ROOT/orgs/$CTX_ORG/secrets.env}"
+if [ "${QUOTA_WATCHDOG_FORCE:-0}" != "1" ] \
+   && [ -f "$SECRETS_ENV" ] && grep -qE '^ANTHROPIC_API_KEY=.' "$SECRETS_ENV"; then
+  log "ANTHROPIC_API_KEY present in $SECRETS_ENV — subscription quota N/A (API-key auth). SKIP (spend bounded by Console limit)."
+  exit 0
+fi
+
 # Tool paths — env-overridable so the script is portable (macOS Homebrew puts
 # cortextos under /opt/homebrew/bin; ccusage may be absent). Defaults preserve
 # the original Linux layout.
