@@ -270,7 +270,36 @@ if [ -f "$REGISTRY" ]; then
       REASONS+=("DEPLOYED: $dep MISSING at $dep_path but registered (SoT $sot) — run sync-deployed-scripts.sh apply")
     elif [ -n "$src_hash" ] && [ "$dep_hash" != "$src_hash" ]; then
       DEPLOYED_DRIFT="true"; DEPLOYED_DRIFT_FILES+=("$dep")
-      REASONS+=("DEPLOYED: $dep (${dep_hash:0:8}) != origin/main:$sot (${src_hash:0:8}) — deployed copy lags repo; run sync-deployed-scripts.sh apply")
+      # Determine deploy DIRECTION before recommending a fix. The canned "run
+      # sync-apply" remediation assumes the deployed copy is BEHIND main; if it is
+      # actually AHEAD (carrying a fix not yet merged), sync-apply would REVERT it —
+      # the 2026-06-29 SYS-AUTH-APIKEY-01 footgun. Resolve direction by matching the
+      # deployed content's git blob against <sot> across history: a match on a commit
+      # NOT contained in origin/main ⇒ deployed is AHEAD; a match on an ancestor of
+      # origin/main ⇒ genuinely BEHIND; no match ⇒ a manual/diverged edit. Bounded
+      # cost: <sot> are small registry scripts with modest history. (task_1782743371901)
+      dep_blob="$(git -C "$FRAMEWORK_ROOT" hash-object "$dep_path" 2>/dev/null || echo "")"
+      dep_dir="unknown"
+      if [ -n "$dep_blob" ] && [ -n "$REMOTE_SHA" ]; then
+        match_commit="$(git -C "$FRAMEWORK_ROOT" rev-list --all -- "$sot" 2>/dev/null | while read -r _c; do
+          _cb="$(git -C "$FRAMEWORK_ROOT" rev-parse --quiet --verify "$_c:$sot" 2>/dev/null)" || continue
+          if [ "$_cb" = "$dep_blob" ]; then echo "$_c"; break; fi
+        done)"
+        if [ -n "$match_commit" ]; then
+          if git -C "$FRAMEWORK_ROOT" merge-base --is-ancestor "$match_commit" "$REMOTE_SHA" 2>/dev/null; then
+            dep_dir="behind"
+          else
+            dep_dir="ahead"
+          fi
+        fi
+      fi
+      if [ "$dep_dir" = "ahead" ]; then
+        REASONS+=("DEPLOYED-AHEAD: $dep (${dep_hash:0:8}) is AHEAD of origin/main:$sot (${src_hash:0:8}) — deployed carries content not yet on main; MERGE it to main, do NOT run sync-apply (it would REVERT the deployed copy)")
+      elif [ "$dep_dir" = "behind" ]; then
+        REASONS+=("DEPLOYED: $dep (${dep_hash:0:8}) != origin/main:$sot (${src_hash:0:8}) — deployed copy lags repo; run sync-deployed-scripts.sh apply")
+      else
+        REASONS+=("DEPLOYED-DIVERGED: $dep (${dep_hash:0:8}) != origin/main:$sot (${src_hash:0:8}) — content matches no known commit for this path (manual edit?); reconcile by hand, do NOT blindly sync-apply")
+      fi
     fi
   done < "$REGISTRY"
 else
