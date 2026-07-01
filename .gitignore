@@ -81,6 +81,10 @@ dashboard/test-*.py
 !community/agents/research-agent/
 !community/agents/research-agent/**
 
-# Internal dev-artifact reports — purged 2026-07-01 to match upstream a1883bb1 (roster/cron/operator-path hygiene)
-/WINDOWS_INSTALL_REPORT.md
-/docs/phase-reports/
+# Internal ops/dev reports — never public (2026-07-01 leak remediation, SEC-1 L4; matches upstream a1883bb1).
+# docs/ is already ignored above; these cover root-level and phase-report globs
+# so a dev artifact cannot re-track outside docs/. Real user docs live elsewhere.
+WINDOWS_INSTALL_REPORT.md
+*INSTALL_REPORT.md
+/PHASE*-REPORT.md
+docs/phase-reports/
