@@ -98,6 +98,8 @@ export class StaleAgentWatchdog {
   private rateLimitRestartCount: Map<string, { count: number; windowStart: number }> = new Map();
   /** Agents halted due to repeated rate-limit relapses — needs manual resume */
   private haltedForRateLimit: Set<string> = new Set();
+  /** Per-org cache of ANTHROPIC_API_KEY-auth detection (value + read time) */
+  private apiKeyAuthCache: Map<string, { value: boolean; at: number }> = new Map();
 
   constructor(
     agentManager: AgentManager,
@@ -175,6 +177,27 @@ export class StaleAgentWatchdog {
 
       // Heartbeat is stale. Check WHY before deciding to restart.
 
+      // --- API-key auth guard (SYS-AUTH-APIKEY-01, daemon parity) ---
+      // When the org authenticates via ANTHROPIC_API_KEY there is NO subscription
+      // rate limit to protect against. getRateLimitInfo's stdout pattern-scan then
+      // only produces false positives — an agent merely *discussing* "rate limit"
+      // in its output trips it — which bypass the idle exemption below and drive
+      // spurious relapse-halts (2026-07-01 incident: BA/cannametrics/FE frozen 2h
+      // at 3%/11% real usage). Mirror the shell quota-watchdog.sh guard: disable
+      // rate-limit handling and self-heal any agent already halted by a prior
+      // false positive. Genuine freeze/wedge restarts still flow through below.
+      const apiKeyAuth = this.isApiKeyAuth(this.findAgentOrg(name));
+      if (apiKeyAuth && this.haltedForRateLimit.has(name)) {
+        this.haltedForRateLimit.delete(name);
+        this.lastRateLimitRestartAt.delete(name);
+        this.rateLimitRestartCount.delete(name);
+        this.rateLimitResetsAt.delete(name);
+        console.log(
+          `[watchdog] ${name} un-halted: API-key auth (no subscription quota; ` +
+          `prior rate-limit halt was a false positive)`,
+        );
+      }
+
       // Skip agents explicitly halted due to repeated rate-limit relapses.
       // User has to manually resume via `cortextos start <agent>`.
       if (this.haltedForRateLimit.has(name)) {
@@ -190,7 +213,10 @@ export class StaleAgentWatchdog {
       }
 
       // --- Rate-limit detection ---
-      const rateLimitInfo = this.getRateLimitInfo(name);
+      // Skipped entirely under API-key auth (no subscription quota — see guard above).
+      const rateLimitInfo = apiKeyAuth
+        ? { isLimited: false as const }
+        : this.getRateLimitInfo(name);
 
       if (rateLimitInfo.isLimited) {
         const now = Date.now();
@@ -665,6 +691,30 @@ export class StaleAgentWatchdog {
   /**
    * Read per-agent config.json if it exists.
    */
+  /**
+   * True when the given org authenticates via ANTHROPIC_API_KEY (no OAuth
+   * subscription quota). Mirrors the `^ANTHROPIC_API_KEY=.` guard in the shell
+   * quota-watchdog.sh (SYS-AUTH-APIKEY-01). Cached per-org for 5 min so we don't
+   * re-read secrets.env on every check tick; auth mode changes are picked up
+   * within a cache window (a daemon restart on config change clears it anyway).
+   */
+  private isApiKeyAuth(org: string | undefined): boolean {
+    if (!org) return false;
+    const now = Date.now();
+    const cached = this.apiKeyAuthCache.get(org);
+    if (cached && now - cached.at < 5 * 60 * 1000) return cached.value;
+    let value = false;
+    try {
+      const secretsPath = join(this.frameworkRoot, 'orgs', org, 'secrets.env');
+      const content = readFileSync(secretsPath, 'utf-8');
+      value = /^ANTHROPIC_API_KEY=.+/m.test(content);
+    } catch {
+      value = false; // secrets.env missing/unreadable → assume OAuth (fail-safe)
+    }
+    this.apiKeyAuthCache.set(org, { value, at: now });
+    return value;
+  }
+
   private readAgentConfig(agentName: string): AgentConfig | null {
     try {
       const orgsDir = join(this.frameworkRoot, 'orgs');
@@ -685,5 +735,27 @@ export class StaleAgentWatchdog {
       // orgs dir missing or unreadable
     }
     return null;
+  }
+
+  /**
+   * Resolve the org an agent belongs to by locating its config.json under
+   * orgs/<org>/agents/<agent>/. (AgentConfig itself carries no org field — the
+   * org is the containing directory.) Used to find the org's secrets.env.
+   */
+  private findAgentOrg(agentName: string): string | undefined {
+    try {
+      const orgsDir = join(this.frameworkRoot, 'orgs');
+      const orgDirs = readdirSync(orgsDir, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name);
+      for (const org of orgDirs) {
+        if (existsSync(join(orgsDir, org, 'agents', agentName, 'config.json'))) {
+          return org;
+        }
+      }
+    } catch {
+      // orgs dir missing or unreadable
+    }
+    return undefined;
   }
 }

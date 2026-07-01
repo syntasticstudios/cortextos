@@ -284,6 +284,90 @@ describe('StaleAgentWatchdog fail-safe on bad/missing/ambiguous signal (EXP-DRIV
 });
 
 /**
+ * SYS-AUTH-APIKEY-01 (daemon parity) — API-key-auth rate-limit guard.
+ *
+ * When the org authenticates via ANTHROPIC_API_KEY there is no OAuth
+ * subscription quota, so getRateLimitInfo()'s stdout pattern-scan only produces
+ * FALSE positives — an agent merely emitting the words "rate limit" (or the
+ * literal limit screen echoed in transcript) trips it. Those false positives
+ * bypass the idle exemption and drive spurious relapse-halts (2026-07-01
+ * incident: BA/cannametrics/FE frozen 2h at 3%/11% real usage). The guard must
+ * neutralize the rate-limit path under API-key auth so a stale agent is treated
+ * as a genuine freeze (recoverable restart) — while the OAuth path is unchanged.
+ */
+function seedOrgSecrets(frameworkRoot: string, org: string, contents: string): void {
+  const dir = join(frameworkRoot, 'orgs', org);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'secrets.env'), contents, 'utf-8');
+}
+
+describe('StaleAgentWatchdog API-key-auth guard (SYS-AUTH-APIKEY-01)', () => {
+  let ctxRoot: string;
+  let frameworkRoot: string;
+  let spies: Spies;
+
+  beforeEach(() => {
+    ctxRoot = mkdtempSync(join(tmpdir(), 'cortextos-sw-ak-ctx-'));
+    frameworkRoot = mkdtempSync(join(tmpdir(), 'cortextos-sw-ak-fw-'));
+    spies = { restartAgent: vi.fn(), stopAgent: vi.fn() };
+  });
+  afterEach(() => {
+    rmSync(ctxRoot, { recursive: true, force: true });
+    rmSync(frameworkRoot, { recursive: true, force: true });
+  });
+
+  // Under API-key auth, a rate-limit pattern in stdout is a false positive.
+  // Without the guard this holds (blind-wait); with it, the stale agent is a
+  // genuine freeze and restarts.
+  it('restarts (not holds) a stale agent whose log has a rate-limit pattern when ANTHROPIC_API_KEY is set', async () => {
+    seedHeartbeat(ctxRoot, 'a1', STALE);
+    seedAgentLog(ctxRoot, 'a1', "Some output\nYou've hit your limit\nmore output\n");
+    seedAgentConfig(frameworkRoot, 'testorg', 'a1', { org: 'testorg' });
+    seedOrgSecrets(frameworkRoot, 'testorg', 'ANTHROPIC_API_KEY=sk-ant-abc123\nOTHER=x\n');
+    const wd = new StaleAgentWatchdog(
+      fakeAgentManager([{ name: 'a1', status: 'running' }], spies),
+      ctxRoot,
+      frameworkRoot,
+    );
+    await wd.checkAndRestart();
+    expect(spies.restartAgent).toHaveBeenCalledWith('a1');
+  });
+
+  // Control: SAME log, but OAuth auth (no ANTHROPIC_API_KEY) → C3 blind-wait
+  // behavior preserved (held, not restarted). Proves the guard is the flip.
+  it('still HOLDS the same log under OAuth auth (no ANTHROPIC_API_KEY)', async () => {
+    seedHeartbeat(ctxRoot, 'a1', STALE);
+    seedAgentLog(ctxRoot, 'a1', "Some output\nYou've hit your limit\nmore output\n");
+    seedAgentConfig(frameworkRoot, 'testorg', 'a1', { org: 'testorg' });
+    seedOrgSecrets(frameworkRoot, 'testorg', 'OTHER=x\n'); // no ANTHROPIC_API_KEY
+    const wd = new StaleAgentWatchdog(
+      fakeAgentManager([{ name: 'a1', status: 'running' }], spies),
+      ctxRoot,
+      frameworkRoot,
+    );
+    await wd.checkAndRestart();
+    expect(spies.restartAgent).not.toHaveBeenCalled();
+    expect(spies.stopAgent).not.toHaveBeenCalled();
+  });
+
+  // An empty assignment (`ANTHROPIC_API_KEY=`) is NOT API-key auth — the guard
+  // requires a non-empty value (matches the shell `^ANTHROPIC_API_KEY=.` guard).
+  it('treats an empty ANTHROPIC_API_KEY= as OAuth (holds)', async () => {
+    seedHeartbeat(ctxRoot, 'a1', STALE);
+    seedAgentLog(ctxRoot, 'a1', "Some output\nYou've hit your limit\nmore output\n");
+    seedAgentConfig(frameworkRoot, 'testorg', 'a1', { org: 'testorg' });
+    seedOrgSecrets(frameworkRoot, 'testorg', 'ANTHROPIC_API_KEY=\n');
+    const wd = new StaleAgentWatchdog(
+      fakeAgentManager([{ name: 'a1', status: 'running' }], spies),
+      ctxRoot,
+      frameworkRoot,
+    );
+    await wd.checkAndRestart();
+    expect(spies.restartAgent).not.toHaveBeenCalled();
+  });
+});
+
+/**
  * SYS-STALE-WATCHDOG-IDLE-FP — idle-but-alive exemption.
  *
  * A stale heartbeat alone is NOT a wedge: `update-heartbeat` is activity-driven,
