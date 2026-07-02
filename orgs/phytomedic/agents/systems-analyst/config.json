@@ -104,6 +104,12 @@
       "type": "cron",
       "cron": "13 0 * * *",
       "prompt": "STRIPE-RESTART DRAG-TIMER (one-shot semantics via date-guard; PD-authorized 2026-07-01 msg 1782888665345). STEP 0: cortextos bus update-heartbeat alive. STEP 1 DATE-GUARD: if the current UTC date is BEFORE 2026-07-03, do NOTHING further and end (silent no-op tick). STEP 2 (on/after 2026-07-03): CHECK the two gate tasks via `cortextos bus list-tasks --format json` — task_1782755603748_77510253 (HUMAN Stripe key-creation) and task_1782755603625_52114235 (STRIPE-ROT). GATE-LIFTED if task_1782755603748_77510253 status==completed OR task_1782755603625_52114235 status!=blocked: send NO message. ELSE (both still gated: HUMAN not-completed AND STRIPE-ROT still blocked): message platform-director ONCE, SINGLE-QUOTED body, no backticks/dollar (SO-10): cortextos bus send-message platform-director normal 'DRAG-TIMER FIRED (Stripe restart decouple): the Stripe key-creation gate has not lifted in 4 days (baseline 06-29). Per your decouple-if-drags decision, the held restart bundle (6 benefits: daemon-runtime convergence + PR #668 + PR #667 + state-fix a/b + cron-injection recovery + registry single-source) should now be re-framed to the Founder as a DECOUPLED independent ask in a monitored lull, rather than sitting silently bundled-behind-Stripe. Restart is still Founder-OK-gated; this only stops it waiting on Stripe indefinitely. Your decision to re-frame to Founder.' STEP 3 SELF-REMOVE (whether gate-lifted or fired — this is one-shot): remove the stripe-restart-drag-timer entry from BOTH the worktree config.json crons array AND the live crons.json crons array so it does not re-fire. Do NOT surface anything to the Founder directly."
+    },
+    {
+      "name": "decision-latency-capture",
+      "type": "cron",
+      "cron": "41 18 * * 4",
+      "prompt": "Decision-latency capture (theta-C7 series). Run: python3 $CTX_FRAMEWORK_ROOT/scripts/metrics/decision-latency-capture.py --append — appends a weekly point to state/systems-analyst/decision-latency-timeseries.jsonl (3 series: fleet_decision_latency ruling-binding from PD decision_surfaced events, freeze_park_age, human_action_latency; ruling series is exact, freeze/human are heuristic proxies unless PD emits decision_classified). Review output: if fleet_decision_latency p90/max exceeds ~14d OR an open-censored ruling has been open >14d, flag platform-director (decision sitting too long). Else end. cortextos bus update-cron-fire decision-latency-capture --interval 10080."
     }
   ]
 }
