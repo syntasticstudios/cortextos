@@ -1,6 +1,7 @@
 {
   "agent_name": "user-proxy",
   "enabled": true,
+  "stale_threshold_minutes": 120,
   "crons": [
     {
       "name": "heartbeat",

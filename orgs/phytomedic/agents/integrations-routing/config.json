@@ -1,6 +1,7 @@
 {
   "agent_name": "integrations-routing",
   "enabled": true,
+  "stale_threshold_minutes": 60,
   "crons": [
     {
       "name": "heartbeat",

@@ -1,6 +1,7 @@
 {
   "agent_name": "cannametrics-data",
   "enabled": true,
+  "stale_threshold_minutes": 480,
   "crons": [
     {
       "name": "heartbeat",

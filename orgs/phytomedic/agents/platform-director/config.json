@@ -1,6 +1,7 @@
 {
   "agent_name": "platform-director",
   "enabled": true,
+  "stale_threshold_minutes": 480,
   "crons": [
     {
       "name": "heartbeat",
