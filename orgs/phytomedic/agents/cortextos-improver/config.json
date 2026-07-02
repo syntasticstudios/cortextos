@@ -1,6 +1,7 @@
 {
   "agent_name": "cortextos-improver",
   "enabled": true,
+  "stale_threshold_minutes": 480,
   "startup_delay": 30,
   "max_session_seconds": 255600,
   "max_crashes_per_day": 20,

@@ -1,6 +1,7 @@
 {
   "agent_name": "devops-monitor",
   "enabled": true,
+  "stale_threshold_minutes": 120,
   "crons": [
     {
       "name": "heartbeat",

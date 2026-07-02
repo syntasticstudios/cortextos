@@ -1,6 +1,7 @@
 {
   "agent_name": "backend-architect",
   "enabled": true,
+  "stale_threshold_minutes": 480,
   "crons": [
     {
       "name": "heartbeat",
