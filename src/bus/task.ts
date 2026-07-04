@@ -207,15 +207,21 @@ export function checkTaskDependencies(
  * cross-org assignment required a manual workaround dance where the filer
  * ran update/complete on behalf of the assignee.
  *
- * This helper fixes that by using a two-tier lookup:
+ * This helper fixes that by using a tiered lookup:
  *
  *   1. Fast path: check the caller's OWN org tasks dir first. Most tasks
  *      live there and this check pays zero scan cost when it hits.
- *   2. Fallback: scan every sibling org under `<ctxRoot>/orgs/*` for a
+ *   2. Exact cross-org: scan every sibling org under `<ctxRoot>/orgs/*` for a
  *      matching task file. Only runs when the fast path missed, so
  *      same-org operations take no perf hit.
+ *   3. Prefix fallback (SYS-BUS-CHECKDEPS-IDFORM): if no EXACT match exists,
+ *      resolve an UNSUFFIXED `task_<ms>` id against the on-disk
+ *      `task_<ms>_<rand>.json` files via a `${taskId}_*.json` glob. Callers and
+ *      audits routinely pass the bare `task_<ms>` id; without this they got a
+ *      false `null`, which made checkTaskDependencies report "ready-to-work"
+ *      over real non-completed blockers. Exact matches always win.
  *
- * Task IDs are generated as `task_<epoch_ms>_<3digit_random>` so real
+ * Task IDs are generated as `task_<epoch_ms>_<8digit_random>` so real
  * collisions are effectively impossible — but if the scan ever finds the
  * same ID in multiple orgs (e.g. due to a bug in ID generation or a manual
  * file copy), we warn loudly naming the task ID, the match count, AND the
@@ -231,33 +237,99 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
   // Reject path-traversal task ids before they reach any join() below. This is
   // the chokepoint for updateTask/claimTask/completeTask/checkTaskDependencies.
   validateTaskId(taskId);
-  // Fast path: same-org lookup.
+  // Fast path: same-org exact lookup.
   const sameOrg = join(paths.taskDir, `${taskId}.json`);
   if (existsSync(sameOrg)) return sameOrg;
 
-  // Fallback: cross-org scan.
   const orgsRoot = join(paths.ctxRoot, 'orgs');
-  const matches: Array<{ path: string; org: string }> = [];
+
+  // Tier 1 — exact cross-org scan. Exact ids always take precedence over the
+  // prefix fallback below. If orgs/ is missing/unreadable we still fall through
+  // to the same-org prefix fallback rather than early-returning null.
+  const exact: Array<{ path: string; org: string }> = [];
+  let orgsReadable = true;
   try {
     for (const entry of readdirSync(orgsRoot, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const candidate = join(orgsRoot, entry.name, 'tasks', `${taskId}.json`);
       if (existsSync(candidate)) {
-        matches.push({ path: candidate, org: entry.name });
+        exact.push({ path: candidate, org: entry.name });
       }
     }
   } catch {
-    return null; // orgs/ missing or unreadable
+    orgsReadable = false;
   }
+  if (exact.length > 0) return resolveTaskMatches(exact, taskId, 'exact');
 
-  if (matches.length === 0) return null;
+  // Tier 2 — prefix fallback for an UNSUFFIXED id. Task ids are generated as
+  // `task_<ms>_<rand>`, but callers and audits frequently pass the bare
+  // `task_<ms>` id. The exact lookups above then miss and the caller used to get
+  // a false `null` — which made checkTaskDependencies report "ready-to-work"
+  // even when real non-completed blockers existed (SYS-BUS-CHECKDEPS-IDFORM).
+  // Resolve the bare id by globbing `${taskId}_*.json` across the caller's dir
+  // and every org. The trailing underscore anchors the prefix so a shorter
+  // epoch-ms cannot match a longer one. Dedupe by path so a taskDir nested under
+  // orgs/ is not double-counted.
+  const prefix: Array<{ path: string; org: string }> = [];
+  const seen = new Set<string>();
+  const addPrefix = (dir: string, org: string) => {
+    for (const p of scanTaskPrefix(dir, taskId)) {
+      if (!seen.has(p)) {
+        seen.add(p);
+        prefix.push({ path: p, org });
+      }
+    }
+  };
+  addPrefix(paths.taskDir, '(caller)');
+  if (orgsReadable) {
+    try {
+      for (const entry of readdirSync(orgsRoot, { withFileTypes: true })) {
+        if (entry.isDirectory()) addPrefix(join(orgsRoot, entry.name, 'tasks'), entry.name);
+      }
+    } catch { /* orgs/ became unreadable mid-scan — keep any same-org prefix result */ }
+  }
+  if (prefix.length > 0) return resolveTaskMatches(prefix, taskId, 'prefix');
+
+  return null;
+}
+
+/**
+ * Scan one tasks dir for files matching an UNSUFFIXED id prefix
+ * (`${taskId}_*.json`). The trailing underscore anchors the match so a shorter
+ * epoch-ms cannot prefix-match a longer one. Missing/unreadable dirs → [].
+ */
+function scanTaskPrefix(dir: string, taskId: string): string[] {
+  try {
+    return readdirSync(dir)
+      .filter((f) => f.startsWith(`${taskId}_`) && f.endsWith('.json'))
+      .map((f) => join(dir, f));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Pick a single match from a candidate list, warning (naming the orgs) when more
+ * than one exists so an operator can investigate an ambiguous id without having
+ * to grep. We still return the first match and keep operations flowing — erroring
+ * on a theoretical collision would be worse UX than the warn.
+ */
+function resolveTaskMatches(
+  matches: Array<{ path: string; org: string }>,
+  taskId: string,
+  kind: 'exact' | 'prefix',
+): string {
   if (matches.length > 1) {
     const orgList = matches.map((m) => m.org).join(', ');
-    console.warn(
-      `[task] Ambiguous task id ${taskId}: found in ${matches.length} orgs (${orgList}). ` +
-      `Operating on the first match in org '${matches[0].org}'. ` +
-      `Review task ID generation if this recurs.`,
-    );
+    // Preserve the original exact-tier wording verbatim (operators + tests key on
+    // "found in N orgs"); the prefix tier gets its own distinct message.
+    const label = kind === 'exact'
+      ? `Ambiguous task id ${taskId}: found in ${matches.length} orgs (${orgList}).`
+      : `Ambiguous prefix task id ${taskId}: found ${matches.length} matches (${orgList}).`;
+    const advice = kind === 'exact'
+      ? 'Review task ID generation if this recurs.'
+      : 'Review task ID generation / prefer the full suffixed id if this recurs.';
+    console.warn(`[task] ${label} Operating on the first match in org '${matches[0].org}'. ${advice}`);
   }
   return matches[0].path;
 }
