@@ -59,6 +59,56 @@ describe('Task Management', () => {
     });
   });
 
+  describe('findTaskFile — unsuffixed id prefix resolution (SYS-BUS-CHECKDEPS-IDFORM)', () => {
+    const bare = (id: string) => id.replace(/_\d+$/, '');
+
+    it('resolves an unsuffixed task_<ms> id to the suffixed on-disk file', () => {
+      const id = createTask(paths, 'paul', 'acme', 'Suffixed task');
+      expect(id).not.toEqual(bare(id)); // sanity: generated id is suffixed
+      const resolved = findTaskFile(paths, bare(id));
+      expect(resolved).toContain(`${id}.json`);
+      expect(resolved).toEqual(findTaskFile(paths, id)); // same as exact-id lookup
+    });
+
+    it('exact id match takes precedence over the prefix fallback', () => {
+      const id = createTask(paths, 'paul', 'acme', 'Real task');
+      // Plant a decoy file named for the BARE id; the exact fast path must win.
+      const decoy = join(paths.taskDir, `${bare(id)}.json`);
+      writeFileSync(decoy, JSON.stringify({ id: bare(id), status: 'pending', org: 'acme', assigned_to: 'paul' }));
+      expect(findTaskFile(paths, bare(id))).toEqual(decoy);
+    });
+
+    it('checkTaskDependencies with an unsuffixed id surfaces real blockers (no false ready-to-work)', () => {
+      const blocker = createTask(paths, 'paul', 'acme', 'Blocker (open)');
+      const blocked = createTask(paths, 'paul', 'acme', 'Blocked', { blockedBy: [blocker] });
+      // The bug: passing the bare id used to miss -> [] -> falsely "ready-to-work".
+      const open = checkTaskDependencies(paths, bare(blocked));
+      expect(open).toHaveLength(1);
+      expect(open[0].id).toEqual(blocker);
+      expect(open[0].status).not.toEqual('completed');
+    });
+
+    it('warns on ambiguity when an unsuffixed id prefix-matches multiple files', () => {
+      mkdirSync(paths.taskDir, { recursive: true });
+      const ms = 'task_1783011245930';
+      for (const rand of ['11111111', '22222222']) {
+        writeFileSync(join(paths.taskDir, `${ms}_${rand}.json`), JSON.stringify({ id: `${ms}_${rand}`, status: 'pending', org: 'acme', assigned_to: 'paul' }));
+      }
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const resolved = findTaskFile(paths, ms);
+      expect(resolved).toContain(`${ms}_`);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Ambiguous prefix task id'));
+      warnSpy.mockRestore();
+    });
+
+    it('a shorter epoch-ms does not prefix-match a longer one (underscore anchor)', () => {
+      const id = createTask(paths, 'paul', 'acme', 'Longer ms'); // task_<ms>_<rand>
+      const ms = bare(id).slice('task_'.length);
+      const shorter = `task_${ms.slice(0, -1)}`; // a strictly shorter (different) ms
+      expect(findTaskFile(paths, shorter)).toBeNull();
+    });
+  });
+
   describe('createTask', () => {
     it('creates task with correct JSON format', () => {
       const taskId = createTask(paths, 'paul', 'acme', 'Build landing page', {
