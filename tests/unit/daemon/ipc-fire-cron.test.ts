@@ -314,14 +314,25 @@ describe('handleFireCron — cooldown', () => {
 // ---------------------------------------------------------------------------
 
 describe('handleFireCron — happy path', () => {
-  it('injects correct [CRON: name] prompt format', async () => {
+  it('injects [CRON: name @ts] prompt format (timestamp-salted to avoid MessageDedup — SYS-IPC-01)', async () => {
     writeCronsJson('boris', [makeCron({ prompt: 'Run heartbeat workflow.' })]);
     const { handleFireCron } = await import('../../../src/daemon/ipc-server.js');
     const { fn, calls } = makeInjectFn([true]);
     handleFireCron('boris', 'heartbeat', fn, 1_000_000);
     expect(calls).toHaveLength(1);
     expect(calls[0].agent).toBe('boris');
-    expect(calls[0].text).toBe('[CRON: heartbeat] Run heartbeat workflow.');
+    // Salted with the fire timestamp so repeat test-fires are not dedup-rejected.
+    expect(calls[0].text).toBe(`[CRON: heartbeat @${new Date(1_000_000).toISOString()}] Run heartbeat workflow.`);
+  });
+
+  it('salts distinct timestamps so two fires of the same cron are not byte-identical (SYS-IPC-01)', async () => {
+    writeCronsJson('boris', [makeCron({ prompt: 'Run heartbeat workflow.' })]);
+    const { handleFireCron } = await import('../../../src/daemon/ipc-server.js');
+    const { fn, calls } = makeInjectFn([true, true]);
+    handleFireCron('boris', 'heartbeat', fn, 1_000_000);
+    handleFireCron('boris', 'heartbeat', fn, 2_000_000);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].text).not.toBe(calls[1].text);
   });
 
   it('returns ok:true with firedAt timestamp', async () => {
