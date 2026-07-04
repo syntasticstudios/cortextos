@@ -510,10 +510,12 @@ describe('AD-5: User actions audit', () => {
     expect(result.ok).toBe(true);
     // firedAt is the epoch ms of the fire — core audit field
     expect(result.firedAt).toBe(now);
-    // Injection was called with the expected cron prefix (traceable to cron name)
+    // Injection was called with the expected cron prefix (traceable to cron name).
+    // The prefix is timestamp-salted (`[CRON: <name> @<ts>]`) so repeat fires are
+    // not MessageDedup-rejected — see SYS-IPC-01.
     expect(injectFn).toHaveBeenCalledWith(
       AGENT,
-      expect.stringContaining('[CRON: manual-fire-audit]'),
+      expect.stringContaining('[CRON: manual-fire-audit @'),
     );
   });
 });

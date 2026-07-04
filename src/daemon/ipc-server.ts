@@ -95,10 +95,18 @@ export function handleFireCron(
     return { ok: false, error: `Cooldown active — wait ${waitSec}s before firing again.` };
   }
 
-  // Inject into PTY
-  const injection = `[CRON: ${cronName}] ${cron.prompt}`;
+  // Inject into PTY. Salt with the fire timestamp so MessageDedup (which hashes
+  // the last ~100 injects) does not reject a repeat test-fire of the SAME cron
+  // as a duplicate — same guard the real cron scheduler's onFire uses. Without
+  // it, a second `test-cron-fire <agent> <cron>` injects a byte-identical string
+  // → DEDUPED → injectFn returns false → misreported below as "not found or not
+  // running" even though the agent is alive (SYS-IPC-01).
+  const injection = `[CRON: ${cronName} @${new Date(nowMs).toISOString()}] ${cron.prompt}`;
   const injected = injectFn(agent, injection);
   if (!injected) {
+    // With the salt above, a duplicate-inject is no longer possible here, so a
+    // false return now genuinely means the agent is absent from the registry or
+    // its PTY is gone.
     return { ok: false, error: `Agent '${agent}' not found or not running.` };
   }
 
