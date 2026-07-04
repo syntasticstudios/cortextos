@@ -79,12 +79,19 @@ describe('Task Management', () => {
     });
 
     it('checkTaskDependencies with an unsuffixed id surfaces real blockers (no false ready-to-work)', () => {
-      const blocker = createTask(paths, 'paul', 'acme', 'Blocker (open)');
-      const blocked = createTask(paths, 'paul', 'acme', 'Blocked', { blockedBy: [blocker] });
+      // Manual files with DISTINCT epoch-ms so the bare id resolves unambiguously.
+      // (Two back-to-back createTask calls can share a ms — the very reason ids
+      // carry a random suffix — which would make the BARE lookup ambiguous rather
+      // than exercise the bug under test. Keep the ms distinct + deterministic.)
+      mkdirSync(paths.taskDir, { recursive: true });
+      const blockerId = 'task_1000000000001_11111111';
+      const blockedId = 'task_2000000000002_22222222';
+      writeFileSync(join(paths.taskDir, `${blockerId}.json`), JSON.stringify({ id: blockerId, status: 'pending', org: 'acme', assigned_to: 'paul' }));
+      writeFileSync(join(paths.taskDir, `${blockedId}.json`), JSON.stringify({ id: blockedId, status: 'pending', org: 'acme', assigned_to: 'paul', blocked_by: [blockerId] }));
       // The bug: passing the bare id used to miss -> [] -> falsely "ready-to-work".
-      const open = checkTaskDependencies(paths, bare(blocked));
+      const open = checkTaskDependencies(paths, bare(blockedId)); // 'task_2000000000002'
       expect(open).toHaveLength(1);
-      expect(open[0].id).toEqual(blocker);
+      expect(open[0].id).toEqual(blockerId);
       expect(open[0].status).not.toEqual('completed');
     });
 
