@@ -15,7 +15,17 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   exit 1
 }
 
-HOOKS_DIR="$REPO_ROOT/.git/hooks"
+# Resolve the directory git actually executes hooks from. This honours
+# core.hooksPath (e.g. husky's .husky/_) AND works inside a git worktree,
+# where .git is a FILE and the old hardcoded "$REPO_ROOT/.git/hooks" errors
+# with "not a directory". --git-path reflects core.hooksPath when set.
+HOOKS_DIR="$(cd "$REPO_ROOT" && git rev-parse --path-format=absolute --git-path hooks 2>/dev/null)"
+if [[ -z "$HOOKS_DIR" ]]; then
+  # Fallback for git < 2.31 (no --path-format): anchor a relative path at REPO_ROOT.
+  HOOKS_DIR="$(cd "$REPO_ROOT" && git rev-parse --git-path hooks)"
+  case "$HOOKS_DIR" in /*) : ;; *) HOOKS_DIR="$REPO_ROOT/$HOOKS_DIR" ;; esac
+fi
+mkdir -p "$HOOKS_DIR"
 
 install_hook() {
   local name="$1"
