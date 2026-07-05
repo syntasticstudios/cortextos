@@ -2,6 +2,34 @@ import { readdirSync, readFileSync, existsSync, unlinkSync, statSync } from 'fs'
 import { join } from 'path';
 import type { Heartbeat, BusPaths } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { readCrons } from './crons.js';
+import { resolveScheduleMs } from './cron-state.js';
+
+/** The cron slug whose cadence defines an agent's liveness loop. */
+const HEARTBEAT_CRON_NAME = 'heartbeat';
+
+/**
+ * Best-effort: derive an agent's heartbeat cadence (ms) from its own
+ * 'heartbeat' cron schedule (interval shorthand or 5-field cron expression).
+ *
+ * Used to (a) auto-populate Heartbeat.loop_interval when the update-heartbeat
+ * cron injects `update-heartbeat alive` with no --interval, and (b) compute a
+ * per-agent, cadence-aware STALE threshold in read-all-heartbeats instead of a
+ * fixed 2h that false-flags every agent whose heartbeat cron is slower than 2h
+ * (e.g. the 4h backend-architect / frontend-dev crons).
+ *
+ * Returns NaN when the cron or its schedule is missing or unparseable, so
+ * callers fall back to their own default.
+ */
+export function deriveHeartbeatIntervalMs(agentName: string): number {
+  try {
+    const hb = readCrons(agentName).find(c => c.name === HEARTBEAT_CRON_NAME);
+    if (!hb || !hb.schedule) return NaN;
+    return resolveScheduleMs(hb.schedule);
+  } catch {
+    return NaN;
+  }
+}
 
 /**
  * SessionEnd-hook end-type markers (see src/hooks/hook-crash-alert.ts). A

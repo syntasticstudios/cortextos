@@ -7,8 +7,13 @@ import {
   readCronState,
   parseDurationMs,
   pruneCronState,
+  cronExpressionMinIntervalMs,
+  resolveScheduleMs,
   DEFAULT_PRUNE_MIN_STALE_MS,
 } from '../../../src/bus/cron-state';
+
+const MIN = 60_000;
+const HR = 3_600_000;
 
 let tmpDir: string;
 
@@ -222,5 +227,60 @@ describe('pruneCronState', () => {
 
   it('exposes a sane default staleness floor', () => {
     expect(DEFAULT_PRUNE_MIN_STALE_MS).toBe(14 * 86_400_000);
+  });
+});
+
+describe('cronExpressionMinIntervalMs', () => {
+  // Pre-existing coverage (must not regress).
+  it('every-N-minutes: "*/5 * * * *" -> 5m', () => {
+    expect(cronExpressionMinIntervalMs('*/5 * * * *')).toBe(5 * MIN);
+  });
+  it('every-N-hours: "0 */2 * * *" -> 120m', () => {
+    expect(cronExpressionMinIntervalMs('0 */2 * * *')).toBe(2 * HR);
+  });
+  it('every-4-hours anchored: "12 */4 * * *" -> 4h (backend-architect heartbeat)', () => {
+    expect(cronExpressionMinIntervalMs('12 */4 * * *')).toBe(4 * HR);
+  });
+  it('fixed daily hour: "0 8 * * *" -> 24h', () => {
+    expect(cronExpressionMinIntervalMs('0 8 * * *')).toBe(24 * HR);
+  });
+
+  // Regression: sub-hourly / hourly enumerated-minute expressions that used to
+  // fall through to the 48h fallback and thus never got a real STALE threshold.
+  it('hourly fixed minute: "38 * * * *" -> 60m (user-proxy heartbeat)', () => {
+    expect(cronExpressionMinIntervalMs('38 * * * *')).toBe(60 * MIN);
+  });
+  it('twice-hourly list: "9,39 * * * *" -> 30m (integrations-routing heartbeat)', () => {
+    expect(cronExpressionMinIntervalMs('9,39 * * * *')).toBe(30 * MIN);
+  });
+  it('quarter-hour list: "0,15,30,45 * * * *" -> 15m', () => {
+    expect(cronExpressionMinIntervalMs('0,15,30,45 * * * *')).toBe(15 * MIN);
+  });
+  it('uneven list uses the smallest gap incl. wrap-around: "0,50 * * * *" -> 10m', () => {
+    // gaps: 50 (0->50) and 10 (50->0 wrap); min = 10
+    expect(cronExpressionMinIntervalMs('0,50 * * * *')).toBe(10 * MIN);
+  });
+  it('every minute: "* * * * *" -> 1m', () => {
+    expect(cronExpressionMinIntervalMs('* * * * *')).toBe(1 * MIN);
+  });
+  it('non-5-field input -> 48h fallback', () => {
+    expect(cronExpressionMinIntervalMs('not a cron')).toBe(48 * HR);
+  });
+});
+
+describe('resolveScheduleMs', () => {
+  it('resolves interval shorthand first: "4h" -> 4h', () => {
+    expect(resolveScheduleMs('4h')).toBe(4 * HR);
+  });
+  it('resolves "30m" -> 30m', () => {
+    expect(resolveScheduleMs('30m')).toBe(30 * MIN);
+  });
+  it('falls back to 5-field cron: "9,39 * * * *" -> 30m', () => {
+    expect(resolveScheduleMs('9,39 * * * *')).toBe(30 * MIN);
+  });
+  it('returns NaN for neither shorthand nor 5-field cron', () => {
+    expect(Number.isNaN(resolveScheduleMs('garbage'))).toBe(true);
+    expect(Number.isNaN(resolveScheduleMs(''))).toBe(true);
+    expect(Number.isNaN(resolveScheduleMs('1 2 3'))).toBe(true);
   });
 });
