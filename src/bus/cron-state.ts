@@ -201,6 +201,28 @@ export function cronExpressionMinIntervalMs(expr: string): number {
   const everyMin = /^\*\/(\d+)$/.exec(minute);
   if (everyMin && hour === '*') return parseInt(everyMin[1], 10) * 60_000;
 
+  // Sub-hourly / hourly with enumerated minutes: hour === '*' and the minute
+  // field lists specific minutes — e.g. "38 * * * *" (hourly) or
+  // "9,39 * * * *" (every 30m). The interval is the minimum gap between
+  // consecutive fire-minutes, including the wrap-around gap across the hour
+  // boundary. Without this these expressions fell through to the 48h fallback,
+  // so read-all-heartbeats never applied a real per-agent threshold to
+  // sub-hourly/hourly agents (user-proxy, integrations-routing).
+  if (hour === '*') {
+    if (minute === '*') return 60_000; // every minute
+    if (/^\d+(,\d+)*$/.test(minute)) {
+      const mins = [
+        ...new Set(minute.split(',').map(n => parseInt(n, 10)).filter(n => n >= 0 && n < 60)),
+      ].sort((a, b) => a - b);
+      if (mins.length === 1) return 60 * 60_000; // once per hour
+      if (mins.length > 1) {
+        let minGap = 60 - mins[mins.length - 1] + mins[0]; // wrap-around gap
+        for (let i = 1; i < mins.length; i++) minGap = Math.min(minGap, mins[i] - mins[i - 1]);
+        return minGap * 60_000;
+      }
+    }
+  }
+
   // Every N hours: <fixed-minute> */N * * *
   const everyHour = /^\*\/(\d+)$/.exec(hour);
   if (everyHour) return parseInt(everyHour[1], 10) * 3_600_000;
@@ -209,4 +231,21 @@ export function cronExpressionMinIntervalMs(expr: string): number {
   if (/^\d+$/.test(hour)) return 24 * 3_600_000;
 
   return FALLBACK_MS;
+}
+
+/**
+ * Resolve a schedule string to its firing interval in milliseconds using the
+ * canonical daemon parser order: interval shorthand ("4h", "30m") first, then a
+ * 5-field cron expression ("9,39 * * * *"). This is the single source of truth
+ * for "how often does this schedule fire" outside the daemon scheduler itself.
+ * Returns NaN when the input is neither a valid shorthand nor a 5-field cron
+ * expression — callers should treat NaN as "unknown cadence" and fall back.
+ */
+export function resolveScheduleMs(schedule: string): number {
+  const shorthand = parseDurationMs(schedule);
+  if (!Number.isNaN(shorthand)) return shorthand;
+  if (schedule.trim().split(/\s+/).length === 5) {
+    return cronExpressionMinIntervalMs(schedule);
+  }
+  return NaN;
 }

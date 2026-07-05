@@ -8,7 +8,7 @@ import { createTask, updateTask, reassignTask, completeTask, claimTask, selectAn
 import { decomposeBundle } from '../bus/bundle.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
-import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
+import { updateHeartbeat, readAllHeartbeats, deriveHeartbeatIntervalMs } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
@@ -668,10 +668,24 @@ busCommand
       }
     }
 
+    // Populate loop_interval so downstream staleness checks (read-all-heartbeats,
+    // wedge-watchdog Gate-2) can apply a cadence-aware threshold. The heartbeat
+    // cron injects `update-heartbeat alive` with no --interval, leaving the field
+    // empty for every agent — so derive it from the agent's own heartbeat cron
+    // schedule when the flag is absent. Stored as minutes shorthand ("240m") so
+    // parseDurationMs consumers read it uniformly.
+    let loopInterval = opts.interval;
+    if (!loopInterval) {
+      const derivedMs = deriveHeartbeatIntervalMs(env.agentName);
+      if (!Number.isNaN(derivedMs) && derivedMs > 0) {
+        loopInterval = `${Math.round(derivedMs / 60_000)}m`;
+      }
+    }
+
     updateHeartbeat(paths, env.agentName, status, {
       org: env.org,
       timezone: opts.timezone,
-      loopInterval: opts.interval,
+      loopInterval,
       currentTask: opts.task,
       displayName,
     });
@@ -705,8 +719,18 @@ busCommand
       return;
     }
 
+    const STALE_FALLBACK_MS = 2 * 60 * 60 * 1000;
     for (const hb of heartbeats) {
-      const stale = new Date(hb.last_heartbeat) < new Date(Date.now() - 2 * 60 * 60 * 1000);
+      // Cadence-aware STALE threshold = 2x the agent's heartbeat interval.
+      // Prefer the stored loop_interval; fall back to deriving it from the
+      // agent's heartbeat cron; only use the fixed 2h when the cadence is
+      // genuinely unknown. A fixed 2h false-flagged every agent with a >2h
+      // heartbeat cron (4h backend-architect/frontend-dev) for ~2h of every
+      // cycle, and false-STALE can trigger unnecessary restarts.
+      let loopMs = parseDurationMs(hb.loop_interval || '');
+      if (Number.isNaN(loopMs) || loopMs <= 0) loopMs = deriveHeartbeatIntervalMs(hb.agent);
+      const thresholdMs = !Number.isNaN(loopMs) && loopMs > 0 ? 2 * loopMs : STALE_FALLBACK_MS;
+      const stale = Date.now() - new Date(hb.last_heartbeat).getTime() > thresholdMs;
       const staleFlag = stale ? ' [STALE]' : '';
       const label = hb.display_name ? `${hb.display_name} (${hb.agent})` : hb.agent;
       console.log(`${label} (${hb.org}) — ${hb.status}${staleFlag} — last seen ${hb.last_heartbeat}`);
