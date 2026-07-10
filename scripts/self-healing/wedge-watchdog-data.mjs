@@ -260,7 +260,20 @@ export function lastCronFireMs(root, name) {
   return t.length ? Math.max(...t) : 0;
 }
 
-/** newest of {pty stdout.log mtime (live-stream/output), state-dir newest file mtime}. */
+/**
+ * State-dir files that are LIVENESS/machinery footprint, NOT proof of agent work.
+ * The heartbeat store is re-touched by every heartbeat write — including a wedged-heartbeat
+ * cron that fires but never advances the stored value (the FE 2026-07-06 mask: fs-touch
+ * 143min old while the store hb was frozen). Counting its mtime as "work produced" lets a
+ * dead agent's own heartbeat mechanism keep `lastActivity` fresh and defeat the Gate-B2
+ * window cap. Gate A already reads the heartbeat VALUE separately (see `lastHeartbeatMs`),
+ * so excluding its mtime here removes a double-count — it does not blind any gate.
+ * (SYS-MASK-01b follow-up B, "root-belt": closes the re-touch-every-interval case that the
+ * B2 window cap alone cannot.) Kept as a Set so sibling machinery files can be added later.
+ */
+export const HB_STORE_FILES = new Set(['heartbeat.json']);
+
+/** newest of {pty stdout.log mtime (live-stream/output), state-dir newest NON-machinery file mtime}. */
 export function lastActivity(root, name) {
   let best = 0, source = 'none';
   const consider = (ms, src) => { if (ms > best) { best = ms; source = src; } };
@@ -271,6 +284,7 @@ export function lastActivity(root, name) {
   try {
     const sd = join(root, 'state', name);
     for (const f of readdirSync(sd)) {
+      if (HB_STORE_FILES.has(f)) continue; // heartbeat footprint is liveness, not work — SYS-MASK-01b-B
       try { consider(statSync(join(sd, f)).mtimeMs, `state/${f}`); } catch { /* skip */ }
     }
   } catch { /* skip */ }

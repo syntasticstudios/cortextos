@@ -6,8 +6,12 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   median, recordHbObservation, deriveIntervalFromHbObs, resolveInterval, applyTrust,
+  lastActivity, HB_STORE_FILES,
   MIN_HB_ADVANCES, BOOTSTRAP_PRIOR_MS,
 } from './wedge-watchdog-data.mjs';
 
@@ -88,3 +92,82 @@ test('bootstrap (c): once TRUSTED, a real RESTART passes through (normal eval re
 // ESCALATE, not silent-hold-forever] is the runner's stateful surface-persistence path
 // (surfaceSince + COOLDOWN_MS reuse); verified live in the shadow dry-run + described in the
 // re-review bundle. applyTrust above proves the SURFACE downgrade (the (b) entry condition).
+
+// --- SYS-MASK-01b follow-up B: heartbeat-store excluded from lastActivity() sources -----------
+// The Gate-B2 window cap (PR #117) stops a one-shot wedged-heartbeat burst from masking a reap,
+// but a wedged heartbeat that RE-touches its store every interval would refresh lastActivity to
+// ~now and defeat any window. Root-belt: lastActivity() must skip the heartbeat store so a
+// heartbeat write can never register as "work produced". These pin that exclusion at the fs layer
+// (evaluateWedge only sees the already-computed lastActivityMs, so the exclusion is untestable
+// there; lib test 16 covers the lib-layer 143min-reap via the cap).
+
+// mtimes are fixed epoch SECONDS (utimesSync) — deterministic, no Date.now.
+const T_FRESH = 2_000_000_000; // newer
+const T_OLD   = 1_000_000_000; // older (real work, long ago)
+
+function buildRoot(stateFiles /* {name: mtimeSec} */, logMtimeSec) {
+  const root = mkdtempSync(join(tmpdir(), 'wedge-lastactivity-'));
+  const name = 'tgt';
+  const sd = join(root, 'state', name);
+  mkdirSync(sd, { recursive: true });
+  for (const [f, mt] of Object.entries(stateFiles)) {
+    const p = join(sd, f);
+    writeFileSync(p, 'x');
+    utimesSync(p, mt, mt);
+  }
+  if (logMtimeSec != null) {
+    const ld = join(root, 'logs', name);
+    mkdirSync(ld, { recursive: true });
+    const lp = join(ld, 'stdout.log');
+    writeFileSync(lp, 'x');
+    utimesSync(lp, logMtimeSec, logMtimeSec);
+  }
+  return { root, name, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+test('lastActivity: heartbeat.json is in the exclusion set', () => {
+  assert.ok(HB_STORE_FILES.has('heartbeat.json'));
+});
+
+test('lastActivity (FE mask): hb-store-only FRESH touch NO LONGER registers as activity -> reapable', () => {
+  // Reproduces the FE 2026-07-06 vector at the fs layer: the ONLY fresh mtime in state/ is the
+  // heartbeat store (a wedged-heartbeat fs-touch that never advanced the value); no stdout.log.
+  // Pre-fix this returned source='state/heartbeat.json' at T_FRESH and SPARED the dead agent.
+  const { root, name, cleanup } = buildRoot({ 'heartbeat.json': T_FRESH });
+  try {
+    const r = lastActivity(root, name);
+    assert.notEqual(r.source, 'state/heartbeat.json', 'the heartbeat touch must not be counted as work');
+    assert.equal(r.source, 'none');
+    assert.equal(r.ms, 0, 'no real activity -> lastActivityMs stays 0 (large ago -> B2 reap)');
+  } finally { cleanup(); }
+});
+
+test('lastActivity: REAL work touch STILL spares even when hb-store is fresh alongside it', () => {
+  // A genuine work file written this interval must still be seen (invariant: never blind real work).
+  const { root, name, cleanup } = buildRoot({ 'heartbeat.json': T_FRESH, 'commit-marker': T_FRESH });
+  try {
+    const r = lastActivity(root, name);
+    assert.equal(r.source, 'state/commit-marker', 'real state work must be the reported source');
+    assert.equal(r.ms, T_FRESH * 1000);
+  } finally { cleanup(); }
+});
+
+test('lastActivity: hb-store excluded but stdout.log stream signal is preserved', () => {
+  // The live-stream signal (stdout.log mtime) is the primary proof-of-work and must be untouched.
+  const { root, name, cleanup } = buildRoot({ 'heartbeat.json': T_FRESH }, /*log*/ T_FRESH);
+  try {
+    const r = lastActivity(root, name);
+    assert.equal(r.source, 'stdout.log');
+    assert.equal(r.ms, T_FRESH * 1000);
+  } finally { cleanup(); }
+});
+
+test('lastActivity: hb-store fresh but only OLD real work -> reports the OLD real work (not the hb touch)', () => {
+  // Confirms the fallback: with hb excluded, the newest NON-hb signal wins even if it is stale.
+  const { root, name, cleanup } = buildRoot({ 'heartbeat.json': T_FRESH, 'old-work': T_OLD });
+  try {
+    const r = lastActivity(root, name);
+    assert.equal(r.source, 'state/old-work');
+    assert.equal(r.ms, T_OLD * 1000);
+  } finally { cleanup(); }
+});
