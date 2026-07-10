@@ -73,6 +73,8 @@ PROBE_DIR="$(dirname "${BASH_SOURCE[0]}")"
 [ -f "$PROBE_DIR/deploy-drift-hold-lib.sh" ]   && source "$PROBE_DIR/deploy-drift-hold-lib.sh"
 # shellcheck source=/dev/null
 [ -f "$PROBE_DIR/deploy-drift-source-lib.sh" ] && source "$PROBE_DIR/deploy-drift-source-lib.sh"
+# shellcheck source=/dev/null
+[ -f "$PROBE_DIR/deploy-drift-crontab-lib.sh" ] && source "$PROBE_DIR/deploy-drift-crontab-lib.sh"
 
 # --- 1. Resolve the LIVE daemon process + the dist it executes ----------------
 # pgrep -f misses the node daemon on macOS in practice; ps is the reliable path.
@@ -330,9 +332,39 @@ else
   log "WARNING: deployed-scripts registry not found at $REGISTRY — skipping deployed-copy dimension"
 fi
 
+# --- 3c. CRONTAB path-source dimension (SYS-DEPLOY, PD 2026-07-10) -------------
+# The cortextos .sh crons (human-task-pulse hourly, daily-digest, feature-overview) MUST route
+# via the stable CLI symlink so they always execute FF-current worktree code. A missing/dangling
+# symlink (npm uninstall/relink) OR a raw-worktree / stale main-checkout bypass = SILENT
+# cron-staleness (this class shipped a not-actually-live #120). Paged LOUD — never fail silent.
+# (reference_crontab_runs_main_checkout_not_worktree.) Orthogonal to the daemon dims, so it also
+# pages through the Founder-gated restart-hold mute (§4b) below.
+CRONTAB_DRIFT="false"; CRONTAB_SIG=""
+CLI_SYMLINK="/opt/homebrew/lib/node_modules/cortextos"        # canonical CLI symlink -> worktree root
+MAIN_CHECKOUT_BASE="${FRAMEWORK_ROOT%%/.claude/worktrees/*}"  # checkout root, e.g. /Users/arndt/cortextos
+if declare -f crontab_symlink_status >/dev/null 2>&1; then
+  CT_TEXT=$(crontab -l 2>/dev/null || true)
+  SYM_STATUS=$(crontab_symlink_status "$CLI_SYMLINK")
+  if [ "${SYM_STATUS%% *}" != "ok" ]; then
+    CRONTAB_DRIFT="true"
+    REASONS+=("CRONTAB-SYMLINK: stable CLI symlink $CLI_SYMLINK is '${SYM_STATUS}' — cortextos crons cannot resolve to the live worktree (npm uninstall/relink?); they run stale or fail")
+  fi
+  CT_BYPASS_PATHS=""
+  CT_BYPASS=$(printf '%s\n' "$CT_TEXT" | crontab_bypass_lines "$MAIN_CHECKOUT_BASE")
+  if [ -n "$CT_BYPASS" ]; then
+    CRONTAB_DRIFT="true"
+    CT_BYPASS_PATHS=$(printf '%s' "$CT_BYPASS" | grep -oE '/[^[:space:]]+\.(sh|mjs)' | sort -u | tr '\n' ',')
+    REASONS+=("CRONTAB-PATH: cron entry/entries bypass the CLI symlink via a raw-worktree or stale main-checkout path: ${CT_BYPASS_PATHS} — a merged script change is NOT live there")
+  fi
+  # Page-once signature: symlink status + the sorted bypass-path set, so a CHANGED drift set re-pages
+  # (and a recovery clears it) — same set-based page-once semantics as source_drift/deployed_drift.
+  CRONTAB_SIG="${SYM_STATUS%% *}:${CT_BYPASS_PATHS}"
+fi
+
 DRIFT="false"
 if [ "$SOURCE_DRIFT" = "true" ] || [ "$RESTART_DRIFT" = "true" ] || [ "$SHA_STALE" = "true" ] \
-   || [ "$DEPLOYED_DRIFT" = "true" ] || [ "$DEPLOYED_ORPHAN" = "true" ]; then
+   || [ "$DEPLOYED_DRIFT" = "true" ] || [ "$DEPLOYED_ORPHAN" = "true" ] \
+   || [ "$CRONTAB_DRIFT" = "true" ]; then
   DRIFT="true"
 fi
 
@@ -399,6 +431,8 @@ cat > "$TOPOLOGY_FILE" <<EOF
   "restart_hold_mute": $RESTART_HOLD_MUTE,
   "hold_tokens": $HOLD_TOKENS_JSON,
   "sha_stale": $SHA_STALE,
+  "crontab_drift": $CRONTAB_DRIFT,
+  "crontab_sig": "$CRONTAB_SIG",
   "deployed_drift": $DEPLOYED_DRIFT,
   "deployed_orphan": $DEPLOYED_ORPHAN,
   "deployed_drift_files": $DEPLOYED_DRIFT_JSON,
@@ -449,7 +483,7 @@ if [ "$SOURCE_DRIFT" = "true" ] && declare -f source_drift_sig >/dev/null 2>&1; 
   SOURCE_SIG=$(source_drift_sig "$FRAMEWORK_ROOT" "$BUILD_SHA" "$REMOTE_SHA")
 fi
 
-DRIFT_KEY="src=${SOURCE_DRIFT};srcsig=${SOURCE_SIG};sha=${SHA_STALE};pid=${DAEMON_PID};dep=${DEPLOYED_SIG};hold=${RESTART_HOLD};holdmute=${RESTART_HOLD_MUTE}"
+DRIFT_KEY="src=${SOURCE_DRIFT};srcsig=${SOURCE_SIG};sha=${SHA_STALE};pid=${DAEMON_PID};dep=${DEPLOYED_SIG};hold=${RESTART_HOLD};holdmute=${RESTART_HOLD_MUTE};crontab=${CRONTAB_SIG}"
 LAST_KEY=$(cat "$MARKER" 2>/dev/null || echo "")
 
 # Restart-hold mute (section 4b): while the held daemon-process restart is Founder-gated
@@ -459,7 +493,7 @@ LAST_KEY=$(cat "$MARKER" 2>/dev/null || echo "")
 # daemon lag or a real restart always pages. Topology artifact records everything regardless.
 PAGE_DRIFT="$DRIFT"
 if [ "$RESTART_HOLD_MUTE" = "true" ]; then
-  if [ "$DEPLOYED_DRIFT" = "true" ] || [ "$DEPLOYED_ORPHAN" = "true" ] || [ "$SHA_STALE" = "true" ]; then
+  if [ "$DEPLOYED_DRIFT" = "true" ] || [ "$DEPLOYED_ORPHAN" = "true" ] || [ "$SHA_STALE" = "true" ] || [ "$CRONTAB_DRIFT" = "true" ]; then
     PAGE_DRIFT="true"
   else
     PAGE_DRIFT="false"
