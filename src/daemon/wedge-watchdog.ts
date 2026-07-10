@@ -72,8 +72,29 @@ const PD_ORCHESTRATOR_NAME = 'platform-director';
 // Arm-flag helper (exported so daemon/index.ts can log it)
 // ---------------------------------------------------------------------------
 
+/**
+ * LOCKED-SHADOW (SYS-MASK-01b DECISION 2, PD 2026-07-10).
+ * The launchd `scripts/self-healing/wedge-watchdog.mjs` is the CANONICAL wedge
+ * reaper. An in-process reaper wedges WITH the daemon it is meant to heal, and
+ * running two armed reapers on one fleet risks double-reap / conflicting logic
+ * (this .ts has NO B2 activity gate, so it would reap signatures the .mjs
+ * deliberately spares). This watchdog is therefore permanently LOCKED to SHADOW:
+ * it observes and logs but NEVER restarts, regardless of environment.
+ * `CTX_WEDGE_WATCHDOG_ARMED` is intentionally ignored — arm capability cannot be
+ * restored by an env var or settings drift, only by flipping this constant in
+ * code + review + a Founder-gated daemon restart.
+ */
+const IN_PROCESS_REAPER_LOCKED_SHADOW = true;
+
 export function wedgeWatchdogArmed(): boolean {
+  // Locked: env is read only to surface a warning in start(); it can never arm.
+  if (IN_PROCESS_REAPER_LOCKED_SHADOW) return false;
   return process.env.CTX_WEDGE_WATCHDOG_ARMED === '1';
+}
+
+/** True when the env requested arming but the lock overrode it (for logging). */
+export function wedgeWatchdogArmSuppressed(): boolean {
+  return IN_PROCESS_REAPER_LOCKED_SHADOW && process.env.CTX_WEDGE_WATCHDOG_ARMED === '1';
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +144,11 @@ export class WedgeWatchdog {
 
   start(): void {
     if (this.timer) return;
-    const mode = wedgeWatchdogArmed() ? 'ARMED' : 'SHADOW (default-off)';
+    const mode = IN_PROCESS_REAPER_LOCKED_SHADOW
+      ? (wedgeWatchdogArmSuppressed()
+          ? 'LOCKED-SHADOW (env arm IGNORED — .mjs is canonical)'
+          : 'LOCKED-SHADOW (.mjs is canonical)')
+      : (wedgeWatchdogArmed() ? 'ARMED' : 'SHADOW (default-off)');
     console.log(
       `[wedge-watchdog] Started (${mode}, check every ${this.checkIntervalMs / 60000}m, ` +
       `cron-lookback ${CRON_FIRE_LOOKBACK_MS / 60000}m, cooldown ${WEDGE_COOLDOWN_MS / 60000}m)`,
@@ -330,6 +355,12 @@ export class WedgeWatchdog {
   }
 
   private async doRestart(agentName: string, gate: TripleGateResult): Promise<void> {
+    if (IN_PROCESS_REAPER_LOCKED_SHADOW) {
+      // Unreachable via checkAll() (arm helper is false), but hard-stop any
+      // future direct caller — the in-process reaper must never restart.
+      this.emitShadow(agentName, gate, 'LOCKED_SHADOW');
+      return;
+    }
     const hbAgeMin = Math.round((gate.details.hbAgeMs ?? 0) / 60000);
     console.log(
       `[wedge-watchdog] ARMED: restarting ${agentName} (wedge detected). ` +
