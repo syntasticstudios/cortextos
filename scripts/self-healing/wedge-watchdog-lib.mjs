@@ -43,6 +43,25 @@ export const FROZEN_INTERVALS = 2;   // Gate A: hb-frozen >= N x agent's own hb 
 export const CPU_IDLE_PCT = 2.0;     // Gate B: PTY "~0% CPU" ceiling
 export const STALL_INTERVALS = 2;    // corroborator + Gate-C cron-advancing window (x interval)
 
+// Gate B2 REAP-SAFE activity-window cap (SYS-MASK-01b). The B2 "producing" window is
+// nominally the Gate-A threshold (FROZEN_INTERVALS x own interval), which for a heavy
+// 240-min agent balloons to ~480min. A wedged-HEARTBEAT burst — a heartbeat-cron fs-touch
+// that fired but FAILED to bump the store hb (the opposite of proof-of-life; FE 2026-07-06,
+// touch 143min old while store hb frozen 14:14Z) — then falls INSIDE that 480min window and
+// SPARES a genuinely-dead agent from reap (the never-heal false-negative). Capping the B2
+// window at a bounded max-work-turn stops a stale burst from masking.
+//
+// REAP-SAFETY: this is a RESTART/REAP gate (auto-acts), not alert-only, so the cap is set
+// ABOVE the fleet-heartbeat ALERT cap (BUSY_WINDOW_MIN=60) with margin — NOT a blind copy.
+// 90min is comfortably longer than any real single work-turn that produces ZERO fs/bus
+// footprint: a LIVE Anthropic stream advances stdout.log mtime within minutes (in
+// lastActivityMs), and a child build/rebase is caught by Gate-B1 process-tree CPU. An agent
+// with hb-frozen >=2x interval AND ~0% tree-CPU AND no stdout/state/bus write for 90min IS
+// the wedge. Gate-B1 (tree-CPU) and Gate-C (>=1 other advancing) still independently gate
+// every reap. The cap only bites heavy (>90min-window) agents; fast agents keep their
+// already-tight thresholdA window unchanged (Math.min).
+export const BUSY_WINDOW_MS = 90 * 60_000;   // owner-tunable reap-safe cap on the B2 producing-window
+
 /**
  * @param {object} state
  * @param {number} state.nowMs
@@ -97,14 +116,19 @@ export function evaluateWedge(state) {
   // lastActivitySource is carried into the trace so the shadow log shows WHICH source
   // was newest (PD shadow-watch: surfaces the silent-long-subprocess residual if it appears).
   const activityAgoMs = nowMs - t.lastActivityMs;
-  const gateB2 = activityAgoMs >= thresholdA;
+  // REAP-SAFE cap: window = min(thresholdA, BUSY_WINDOW_MS). Caps the heavy-agent 480min
+  // window at a bounded max-work-turn so a stale wedged-heartbeat burst stops masking, while
+  // leaving fast agents' already-tighter thresholdA untouched. (SYS-MASK-01b)
+  const b2WindowMs = Math.min(thresholdA, BUSY_WINDOW_MS);
+  const gateB2 = activityAgoMs >= b2WindowMs;
   const bTrace = {
     ...aTrace, gateB1: true, gateB2, ptyTreeCpuPct: t.ptyTreeCpuPct, cpuIdlePct: CPU_IDLE_PCT,
     lastActivityAgoMs: activityAgoMs, lastActivitySource: t.lastActivitySource ?? null,
+    b2WindowMs, b2WindowCapped: b2WindowMs < thresholdA,
   };
   if (!gateB2) {
     return mk('none',
-      `work produced in window (last activity ${Math.round(activityAgoMs / 1000)}s ago via ${t.lastActivitySource ?? 'fs/bus'} < ${Math.round(thresholdA / 1000)}s threshold — producing, never-reap)`,
+      `work produced in window (last activity ${Math.round(activityAgoMs / 1000)}s ago via ${t.lastActivitySource ?? 'fs/bus'} < ${Math.round(b2WindowMs / 1000)}s reap-safe window — producing, never-reap)`,
       bTrace);
   }
 

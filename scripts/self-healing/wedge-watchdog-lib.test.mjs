@@ -10,7 +10,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateWedge, FROZEN_INTERVALS } from './wedge-watchdog-lib.mjs';
+import { evaluateWedge, FROZEN_INTERVALS, BUSY_WINDOW_MS } from './wedge-watchdog-lib.mjs';
 
 const MIN = 60_000;
 const NOW = 1_000_000_000_000; // fixed epoch (no Date.now — determinism)
@@ -184,6 +184,58 @@ test('15. truly wedged: no activity ANYWHERE in window -> restart', () => {
   assert.equal(v.trace.gateB2, true);
   // trace carries activity source for the shadow-watch residual (silent-subprocess)
   assert.ok('lastActivityAgoMs' in v.trace);
+});
+
+// --- SYS-MASK-01b: reap-safe B2 activity-window cap fixtures ---------------------
+// The Gate-B2 "producing" window is min(2x own interval, BUSY_WINDOW_MS). Before the cap,
+// a heavy 240-min agent had a ~480min B2 window, so a wedged-HEARTBEAT burst (an fs-touch
+// that fired but never bumped the store hb — the opposite of proof-of-life) fell inside it
+// and SPARED a genuinely-dead agent from reap. These pin the cap AND its reap-safety.
+
+const HEAVY = 240 * MIN; // heavy 240-min heartbeat-cadence agent (window balloons to 480min pre-cap)
+
+test('16. FE wedged-HEARTBEAT burst (heavy agent, fs-touch 143min old, store hb frozen) -> restart [SYS-MASK-01b de-mask]', () => {
+  // Reproduces the FE 2026-07-06 mask: hb-frozen well past 2x interval, pty-alive-idle,
+  // and the ONLY "activity" is a stale heartbeat-cron state-dir touch 143min ago that never
+  // advanced the store hb. 143min < 480min (old window) => was SPARED; 143min >= 90min cap => reap.
+  const v = evaluateWedge(fleet({
+    enabled: true, heartbeatIntervalMs: HEAVY,
+    lastHeartbeatMs: NOW - 500 * MIN,                 // frozen > 2x interval (480min)
+    ptyAlive: true, ptyTreeCpuPct: 0.3,               // idle (B1)
+    lastActivityMs: NOW - 143 * MIN,                  // wedged-heartbeat fs-touch, NOT real work
+    lastActivitySource: 'state/heartbeat.json',
+    lastCronFireMs: NOW - 500 * MIN,
+  }));
+  assert.equal(v.action, 'restart', 'a stale wedged-heartbeat burst must no longer mask the reap');
+  assert.equal(v.trace.gateB2, true);
+  assert.equal(v.trace.b2WindowCapped, true);         // proves the cap (not thresholdA) was applied
+  assert.equal(v.trace.b2WindowMs, BUSY_WINDOW_MS);   // guardrail: fails if the cap is tuned >143min (re-masks the FE vector)
+});
+
+test('17. REAP-SAFETY: heavy agent that produced REAL work 50min ago -> none (inside 90min cap, never-reap)', () => {
+  // A genuinely-producing heavy agent that wrote work 50min ago is still protected: 50min < 90min.
+  const v = evaluateWedge(fleet({
+    enabled: true, heartbeatIntervalMs: HEAVY,
+    lastHeartbeatMs: NOW - 500 * MIN, ptyAlive: true, ptyTreeCpuPct: 0.4,
+    lastActivityMs: NOW - 50 * MIN, lastActivitySource: 'commit',
+    lastCronFireMs: NOW - 500 * MIN,
+  }));
+  assert.equal(v.action, 'none', 'work within the reap-safe window must still spare the agent');
+  assert.equal(v.trace.gateB2, false);
+});
+
+test('18. cap does NOT bite fast agents: 4-min agent window stays thresholdA (uncapped)', () => {
+  const v = evaluateWedge(fleet({
+    enabled: true, heartbeatIntervalMs: HB,
+    lastHeartbeatMs: NOW - 3 * HB, ptyAlive: true, ptyTreeCpuPct: 0.2,
+    lastActivityMs: NOW - 1 * HB, lastActivitySource: 'stdout.log', // 4min < 8min window -> spared
+    lastCronFireMs: NOW - 3 * HB,
+  }));
+  assert.equal(v.action, 'none');
+  assert.equal(v.trace.gateB2, false);
+  assert.equal(v.trace.b2WindowCapped, false, 'fast-agent window (8min) is below the cap => uncapped');
+  assert.equal(v.trace.b2WindowMs, 2 * HB);
+  assert.ok(2 * HB < BUSY_WINDOW_MS, 'precondition: fast-agent window is below the cap');
 });
 
 test('sanity: FROZEN_INTERVALS guard is the >=2 conservative window', () => {
