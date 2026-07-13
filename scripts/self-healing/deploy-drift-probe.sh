@@ -97,9 +97,24 @@ log "live daemon pid=$DAEMON_PID framework_root=$FRAMEWORK_ROOT"
 # --- 2. Gather facts ----------------------------------------------------------
 BUILD_SHA=$(tr -d '[:space:]' < "$BUILD_SHA_FILE" 2>/dev/null || echo "")
 
-# origin/main tip (best-effort fetch; tolerate offline).
-git -C "$FRAMEWORK_ROOT" fetch origin main --quiet 2>/dev/null || \
-  log "WARNING: git fetch failed — comparing against last-known origin/main"
+# origin/main tip (best-effort fetch; tolerate offline OR a stalled network).
+# BOUND the fetch: an intermittent network stall on an unbounded `git fetch` hangs
+# past the 2min cron budget (exit 143, burning a full agent turn — seen ~2x/hr,
+# task_1783860594319). Fetch failure is ALREADY tolerated below via the WARNING →
+# last-known-origin/main fallback, so failing FAST is zero-behavior-change:
+#   • GIT_HTTP_LOW_SPEED_* — git-native, no external dep: abort if the HTTPS transfer
+#     stays under 1000 B/s for 15s (catches mid-transfer stalls). origin is HTTPS
+#     (verified) so this applies.
+#   • gtimeout/timeout — hard wall-clock cap (belt for DNS/TCP-connect hangs that the
+#     low-speed limit can't see, since no bytes have flowed yet). Optional: only used
+#     if present (absent on a bare macOS without coreutils → low-speed limit still guards).
+# NB: bash 3.2 (macOS default) errors on "${arr[@]}" for an EMPTY array under `set -u`,
+# so the guard prefix is expanded via the ${arr[@]+…} idiom (empty → nothing, no error).
+FETCH_GUARD=(); command -v gtimeout >/dev/null 2>&1 && FETCH_GUARD=(gtimeout 30)
+[ ${#FETCH_GUARD[@]} -eq 0 ] && command -v timeout >/dev/null 2>&1 && FETCH_GUARD=(timeout 30)
+GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=15 \
+  ${FETCH_GUARD[@]+"${FETCH_GUARD[@]}"} git -C "$FRAMEWORK_ROOT" fetch origin main --quiet 2>/dev/null || \
+  log "WARNING: git fetch failed/timed out — comparing against last-known origin/main"
 REMOTE_SHA=$(git -C "$FRAMEWORK_ROOT" rev-parse origin/main 2>/dev/null || echo "")
 
 # mtimes (epoch) of the on-disk build artifacts.
