@@ -13,7 +13,7 @@
       "name": "daily-foundation-health",
       "type": "cron",
       "cron": "6 3 * * *",
-      "prompt": "Daily Cannametrics Foundation Health Check. Review: schema readiness, required tables and relationships, historical capture continuity, price history logic, routing outcome capture, prescription-product linkage, data freshness assumptions, append-only vs mutable data decisions, anything that could damage future analytics value. Output a short daily health note with risks, missing pieces, and recommended next actions. Send findings to user via Telegram using the reporting format: Context, Observation, Why it matters, Risk level, Recommendation, Decision needed. Then record fire: cortextos bus update-cron-fire daily-foundation-health --interval 1440. Then: cortextos bus update-heartbeat alive."
+      "prompt": "Daily Cannametrics Foundation Health Check (internal daily check ALWAYS runs; Founder-facing Telegram is delivery-gated). Review: schema readiness, required tables and relationships, historical capture continuity, price history logic, routing outcome capture, prescription-product linkage, data freshness assumptions, append-only vs mutable data decisions, anything that could damage future analytics value. Assign a single verdict: GREEN (all nominal), YELLOW (degradation or risk emerging), or RED (active data-integrity issue). SETTLE ALL NUMBERS FIRST: verify every count/date against source ONCE before composing any message, so exactly one accurate message is ever sent (NEVER a note+correction+accuracy-fix triple). Then append one compact JSON line to the weekly accumulator at $HOME/.cortextos/default/state/cannametrics-data/foundation-health-week.jsonl with fields date, verdict, summary, key_numbers (create file/dir if missing). Delivery: if verdict is GREEN do NOT Telegram the Founder — the weekly Sunday digest will summarize. If verdict is YELLOW or RED, Telegram the Founder IMMEDIATELY (do not wait for the weekly) using the reporting format: Context, Observation, Why it matters, Risk level, Recommendation, Decision needed — one settled message only. Then record fire: cortextos bus update-cron-fire daily-foundation-health --interval 1440. Then: cortextos bus update-heartbeat alive."
     },
     {
       "name": "backend-schema-review",
@@ -44,6 +44,12 @@
       "type": "cron",
       "cron": "19 4 * * 0",
       "prompt": "Weekly Strategic Drift Check. Detect whether platform work is becoming too doctor-workflow-centric and not preserving the data layer needed for the real long-term moat. This is about direction, not code. Review whether Cannametrics intelligence layer is getting proper attention relative to clinical features. Send findings via Telegram. Then record fire: cortextos bus update-cron-fire weekly-strategic-drift --interval 10080. Then: cortextos bus update-heartbeat alive."
+    },
+    {
+      "name": "weekly-foundation-health-digest",
+      "type": "cron",
+      "cron": "36 3 * * 0",
+      "prompt": "Weekly Foundation-Health Digest (Founder-facing green roll-up; replaces the daily green Telegrams). Read the week's accumulated entries from $HOME/.cortextos/default/state/cannametrics-data/foundation-health-week.jsonl. Compose ONE concise Telegram to the Founder: days checked this week, overall standing (e.g. all-green / N green + M flagged), the current verdict, and a one-line reference to any YELLOW/RED days that were ALREADY alerted same-day (reference only, do NOT re-alarm). SETTLE numbers first — one accurate message. If the file is missing or empty, send a single line: 'Foundation-Health: no entries recorded this week.' After sending, rotate the log: mv the jsonl to foundation-health-week.jsonl.$(date -u +%Y%m%d) so next week starts clean. Then record fire: cortextos bus update-cron-fire weekly-foundation-health-digest --interval 10080. Then: cortextos bus update-heartbeat alive."
     }
   ]
 }
