@@ -18,31 +18,44 @@ auth). A **restart cannot fix** auth-loss / credit-hold / 429 — so the trigger
 **structural and auth-mode-AGNOSTIC**: it fires on the demonstrable fact *"restart isn't
 working,"* independent of cause.
 
-## Inputs (all three are persisted artifacts both paths can read identically)
+## Inputs (all persisted artifacts both paths read identically)
 - **restarts.log** — `[<ts>] WATCHDOG: stale_restart crash_count=<n>` lines (+ `HALTED:`).
-- **crashes.log** — `<ts> type=crash ... session=<uuid> ...` (session-id per respawn).
-- **heartbeat store** — the agent's heartbeat value/timestamp history (to decide advance).
-- **N** — fire threshold (default **3**, matching existing `MAX_RATE_LIMIT_RESTARTS_PER_DAY`).
+  Timestamps here are **no-millis** (`[2026-07-13T00:40:46Z]`).
+- **crashes.log** — `<ts> type=<crash|daemon-stop|…> reason=… session=<uuid> …`.
+  Timestamps here **have millis** (`00:40:47.405Z`). Both `type=crash` AND
+  `type=daemon-stop` lines carry `session=` — only `type=crash` are respawns.
+- **heartbeat store** — `state/{agent}/heartbeat.json` = `{ "last_heartbeat": "<iso>" }`
+  (single CURRENT value, millis; `src/bus/heartbeat.ts`). `last_heartbeat` IS the
+  timestamp of the most recent successful heartbeat = "when hb last advanced".
+- **N** = 3 (matches `MAX_RATE_LIMIT_RESTARTS_PER_DAY`); **scan_window** = 24h; **now**.
 
-## Algorithm (locked)
-1. **T0** = timestamp of the most recent heartbeat **ADVANCE** for the agent (hb value
-   changed). If hb never advanced in the scan window, `T0 = window start`.
-2. **streak** = count of `WATCHDOG: stale_restart` entries in restarts.log with `ts > T0`
-   — i.e. watchdog restarts that did **not** result in recovery (no hb advance after).
-3. **reapWorking** = the session-ids (crashes.log) across the streak's respawns are
-   **distinct** (a NEW session each restart = reap succeeded). If the SAME session-id
-   persists across "restarts", reap is failing — that is a **different** failure class
-   (reap-failure), **not** this trigger.
-4. **newestSessionId** = session-id of the most recent crashes.log respawn.
-5. **ineffective** = `(streak >= N) AND reapWorking`.
-6. On `ineffective`: exponential backoff + **do NOT increment crash_count** toward
-   max_crashes + **pause-until-clear** + **escalate**. Never restart-spam past this.
-7. **clear/reset**: when hb advances (recovery), `streak → 0`, normal restart policy
-   resumes. (Structurally: the next classify sees `T0` move forward, so `streak` drops.)
+## Algorithm (LOCKED v2 — pins from real-log review; see the golden vector)
+**All timestamp comparisons are epoch-ms.** Parse ISO to epoch (handles mixed
+millis/no-millis); a raw string compare misorders `…16.993Z` vs `…16Z` (`.`<`Z`) and
+silently under/over-counts the streak. *(golden case 6 fails a string-compare impl.)*
 
-The hb-advance boundary (step 1) is what makes step 3's "streak" self-resetting and makes
-a **stale** signature from a prior recovered episode unable to fire — if the agent
-recovered, hb advanced, so those old restarts fall before T0.
+1. **T0** = `max( epoch(heartbeat.json.last_heartbeat) or 0 , epoch(now) − scan_window )`.
+   `last_heartbeat` is literally "when hb last advanced" — no history needed. A healthy
+   agent has a recent `last_heartbeat` ⇒ recent T0 ⇒ streak 0 ⇒ cannot false-fire. The
+   scan-window floor bounds ancient restarts and the hb-missing case (T0 = now − window).
+   *(hb-advance is the TIMESTAMP, never the status string — status is always "alive".)*
+2. **streak** = count of `WATCHDOG: stale_restart` restarts.log entries with
+   `epoch(ts) > T0`. (The `>T0` filter naturally excludes restarts before the last
+   recovery, so a re-wedge after a recovery counts only its own restarts.)
+3. **reapWorking** = the `type=crash` **only** respawn lines (exclude `type=daemon-stop`)
+   with `epoch(ts) > T0` have **distinct** session-ids **and** their count `== streak`
+   (paired 1:1 to the restarts, not filtered independently). Count `!= streak` or a
+   repeated session ⇒ `reapWorking = false` (conservative). A persisting same-session-id
+   is **reap-failure** — a different class, not this trigger.
+   *(golden case 7 fails a count-all-`session=` impl.)*
+4. **newestSessionId** = session of the newest `type=crash` line **only**.
+5. **ineffective** = `(streak >= N) AND reapWorking`. (hbFrozen is implicit: N restarts
+   after T0 with T0 still == current `last_heartbeat` ⇒ hb never advanced despite N restarts.)
+6. On `ineffective`: exponential backoff + **do NOT increment crash_count** + **pause-
+   until-clear** + **escalate**. Never restart-spam past this.
+7. **clear/reset**: hb advances ⇒ `last_heartbeat` moves ⇒ T0 moves forward ⇒ streak
+   drops to 0 next classify ⇒ normal restart policy resumes. This also makes a stale
+   signature from a prior recovered episode unable to fire (recovery advanced hb).
 
 ## Escalation label (post-fire ONLY, current-session-bounded)
 Once `ineffective` fires, scan the CURRENT session's stdout tail (after the most-recent
