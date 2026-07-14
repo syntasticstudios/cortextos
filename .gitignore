@@ -88,3 +88,8 @@ WINDOWS_INSTALL_REPORT.md
 *INSTALL_REPORT.md
 /PHASE*-REPORT.md
 docs/phase-reports/
+
+# OBSERV-01: per-agent tool-call trace (content-free forensics log, auto-pruned).
+# Runtime-local + potentially high-churn — never commit.
+state/*/tool-trace.jsonl
+state/*/tool-trace.jsonl.tmp
