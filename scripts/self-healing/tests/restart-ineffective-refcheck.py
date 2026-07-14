@@ -59,25 +59,38 @@ def classify(case, N, scan_window_ms):
     T0 = max(hb_ms, now_ms - scan_window_ms)
 
     # streak: stale_restart entries with ts > T0 (finding 1: epoch compare)
-    streak_ts = [t for line in case["restarts_log"] if STALE_RE.search(line)
-                 for t in [first_ts_ms(line)] if t is not None and t > T0]
+    streak_ts = sorted(t for line in case["restarts_log"] if STALE_RE.search(line)
+                       for t in [first_ts_ms(line)] if t is not None and t > T0)
     streak = len(streak_ts)
 
-    # respawn session-ids: type=crash ONLY, ts > T0 (finding 2)
+    # respawn lines: type=crash ONLY (exclude type=daemon-stop/halted — finding 2)
     def parse_crash(line):
         tm = TYPE_RE.search(line)
         sm = SESSION_RE.search(line)
         return (tm.group(1) if tm else None, sm.group(1) if sm else None, first_ts_ms(line))
-    crash_only = [(typ, sid, t) for (typ, sid, t) in map(parse_crash, case["crashes_log"])
-                  if typ == "crash" and sid]
-    run_sessions = [sid for (typ, sid, t) in crash_only if t is not None and t > T0]
-    reap_working = (len(run_sessions) == streak and streak > 0
-                    and len(set(run_sessions)) == len(run_sessions))
+    crash_only = sorted(
+        [(sid, t) for (typ, sid, t) in map(parse_crash, case["crashes_log"])
+         if typ == "crash" and sid and t is not None],
+        key=lambda x: x[1])
+
+    # reapWorking = GREEDY 1:1 pairing (finding 5, option b): each streak restart pairs
+    # to the earliest not-yet-used type=crash with ts > restart_ts (its respawn ~1s later).
+    # Robust to extra/unrelated crash lines. All restarts must pair AND sessions distinct.
+    j = 0
+    paired = []
+    for r_ts in streak_ts:
+        while j < len(crash_only) and crash_only[j][1] <= r_ts:
+            j += 1
+        if j >= len(crash_only):
+            paired = None  # a restart had no subsequent crash -> conservative no-reap
+            break
+        paired.append(crash_only[j][0])
+        j += 1
+    reap_working = (streak > 0 and paired is not None
+                    and len(set(paired)) == len(paired) == streak)
 
     # newestSessionId: newest type=crash line only (finding 2 minor)
-    newest = None
-    if crash_only:
-        newest = max(crash_only, key=lambda x: (x[2] if x[2] is not None else -1))[1]
+    newest = crash_only[-1][0] if crash_only else None
 
     ineffective = (streak >= N) and reap_working
 

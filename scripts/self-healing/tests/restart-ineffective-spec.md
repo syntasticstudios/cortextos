@@ -42,12 +42,16 @@ silently under/over-counts the streak. *(golden case 6 fails a string-compare im
 2. **streak** = count of `WATCHDOG: stale_restart` restarts.log entries with
    `epoch(ts) > T0`. (The `>T0` filter naturally excludes restarts before the last
    recovery, so a re-wedge after a recovery counts only its own restarts.)
-3. **reapWorking** = the `type=crash` **only** respawn lines (exclude `type=daemon-stop`)
-   with `epoch(ts) > T0` have **distinct** session-ids **and** their count `== streak`
-   (paired 1:1 to the restarts, not filtered independently). Count `!= streak` or a
-   repeated session ⇒ `reapWorking = false` (conservative). A persisting same-session-id
-   is **reap-failure** — a different class, not this trigger.
-   *(golden case 7 fails a count-all-`session=` impl.)*
+3. **reapWorking** — GREEDY 1:1 pairing (robust to extra/unrelated crash lines; a plain
+   `count(type=crash ts>T0) == streak` false-suppresses when a stray crash inflates the
+   count). Consider `type=crash` **only** (exclude `type=daemon-stop`/`halted`), sorted
+   by epoch(ts). For each streak restart in time order, pair it to the **earliest
+   not-yet-used** `type=crash` with `epoch(ts) > epoch(restart_ts)` (its respawn ~1s
+   later). `reapWorking` = **every** streak restart got a paired crash **and** the paired
+   session-ids are all **distinct**. A restart with no subsequent crash, or a repeated
+   paired session, ⇒ `reapWorking = false` (conservative). A persisting same-session-id
+   across the run is **reap-failure** — a different class, not this trigger.
+   *(golden case 7 fails a count-all-`session=` impl; case 6 fails a string-compare impl.)*
 4. **newestSessionId** = session of the newest `type=crash` line **only**.
 5. **ineffective** = `(streak >= N) AND reapWorking`. (hbFrozen is implicit: N restarts
    after T0 with T0 still == current `last_heartbeat` ⇒ hb never advanced despite N restarts.)
