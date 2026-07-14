@@ -138,6 +138,65 @@
       ],
       "stdout_current_session": "Not logged in · Run /login",
       "expected": {"ineffective": true, "streak": 3, "newestSessionId": "3333cccc-0000-0000-0000-000000000003", "label": "not-logged-in"}
+    },
+    {
+      "name": "8-ir-real-fires-at-cycle-3",
+      "desc": "REAL 2026-07-13 IR auth-loss incident at cycle 3 (03:07Z) — the moment the guard SHOULD fire, ~5.5h before the actual march to 8. Real formats + real session-ids + real not-logged-in stdout. Regression anchor.",
+      "now": "2026-07-13T03:10:00Z",
+      "heartbeat_json": {"last_heartbeat": "2026-07-13T00:10:00Z"},
+      "restarts_log": [
+        "[2026-07-13T00:40:46Z] WATCHDOG: stale_restart crash_count=1",
+        "[2026-07-13T01:41:35Z] WATCHDOG: stale_restart crash_count=2",
+        "[2026-07-13T03:07:16Z] WATCHDOG: stale_restart crash_count=3"
+      ],
+      "crashes_log": [
+        "2026-07-13T00:40:47.405Z type=crash reason=none session=4bb6d6e6-6268-47dc-8706-3b06cda20705 last_task=alive",
+        "2026-07-13T01:41:36.993Z type=crash reason=none session=d421559a-08b8-45d7-918e-185eb294e36c last_task=alive",
+        "2026-07-13T03:07:18.617Z type=crash reason=none session=376da52c-3170-4d5a-b992-188c9c70bfdf last_task=alive"
+      ],
+      "stdout_current_session": "Opus 4.8 (1M context) · API Usage Billing\nNot logged in · Please run /login",
+      "expected": {"ineffective": true, "streak": 3, "newestSessionId": "376da52c-3170-4d5a-b992-188c9c70bfdf", "label": "not-logged-in"}
+    },
+    {
+      "name": "9-ir-real-boundary-N-minus-1-no-fire",
+      "desc": "Same REAL IR incident evaluated at 02:00Z — only 2 real stale_restarts so far (00:40, 01:41). streak 2 < N=3 -> no fire. Proves no premature fire before cycle 3 on real data.",
+      "now": "2026-07-13T02:00:00Z",
+      "heartbeat_json": {"last_heartbeat": "2026-07-13T00:10:00Z"},
+      "restarts_log": [
+        "[2026-07-13T00:40:46Z] WATCHDOG: stale_restart crash_count=1",
+        "[2026-07-13T01:41:35Z] WATCHDOG: stale_restart crash_count=2"
+      ],
+      "crashes_log": [
+        "2026-07-13T00:40:47.405Z type=crash reason=none session=4bb6d6e6-6268-47dc-8706-3b06cda20705 last_task=alive",
+        "2026-07-13T01:41:36.993Z type=crash reason=none session=d421559a-08b8-45d7-918e-185eb294e36c last_task=alive"
+      ],
+      "stdout_current_session": "Opus 4.8 (1M context) · API Usage Billing\nNot logged in · Please run /login",
+      "expected": {"ineffective": false, "streak": 2, "newestSessionId": "d421559a-08b8-45d7-918e-185eb294e36c", "label": "n/a"}
+    },
+    {
+      "name": "10-ir-real-recovery-resets-no-fire",
+      "desc": "After the REAL 09:59Z SIGTERM recovery, cold-start hb advanced to 10:02:36Z. Evaluated at 10:30Z with the FULL real loop history still in the logs (8 stale_restarts + real type=crash + the real 09:59 type=daemon-stop burst). last_heartbeat=10:02 -> T0=10:02 -> every loop restart falls below T0 -> streak 0 -> no fire. Real-data proof that recovery resets the streak AND that daemon-stop sessions never count (newestSessionId = the 09:40 type=crash, NOT the later 09:59 daemon-stops). Crashes list is a representative real subset; streak=0 regardless.",
+      "now": "2026-07-13T10:30:00Z",
+      "heartbeat_json": {"last_heartbeat": "2026-07-13T10:02:36Z"},
+      "restarts_log": [
+        "[2026-07-13T00:40:46Z] WATCHDOG: stale_restart crash_count=1",
+        "[2026-07-13T01:41:35Z] WATCHDOG: stale_restart crash_count=2",
+        "[2026-07-13T03:07:16Z] WATCHDOG: stale_restart crash_count=3",
+        "[2026-07-13T04:18:33Z] WATCHDOG: stale_restart crash_count=4",
+        "[2026-07-13T05:20:48Z] WATCHDOG: stale_restart crash_count=5",
+        "[2026-07-13T06:29:12Z] WATCHDOG: stale_restart crash_count=6",
+        "[2026-07-13T07:39:43Z] WATCHDOG: stale_restart crash_count=7",
+        "[2026-07-13T08:39:49Z] WATCHDOG: stale_restart crash_count=8"
+      ],
+      "crashes_log": [
+        "2026-07-13T03:07:18.617Z type=crash reason=none session=376da52c-3170-4d5a-b992-188c9c70bfdf last_task=alive",
+        "2026-07-13T08:39:50.752Z type=crash reason=none session=be409550-6976-407c-9042-9838b8b999ee last_task=alive",
+        "2026-07-13T09:40:13.258Z type=crash reason=none session=756e2a8e-686c-48e8-910d-5f6beb77785b last_task=alive",
+        "2026-07-13T09:59:45.977Z type=daemon-stop reason=daemon shutdown (SIGTERM) session=55906270-4ef9-42e3-b56a-006f1c85c4e8 last_task=alive",
+        "2026-07-13T09:59:46.114Z type=daemon-stop reason=daemon shutdown (SIGTERM) session=e35272b0-b188-4087-ac36-6d80dcd40774 last_task=alive"
+      ],
+      "stdout_current_session": "Opus 4.8 (1M context) · Claude Max",
+      "expected": {"ineffective": false, "streak": 0, "newestSessionId": "756e2a8e-686c-48e8-910d-5f6beb77785b", "label": "n/a"}
     }
   ]
 }
