@@ -23,6 +23,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
 import { evaluateWedge } from './wedge-watchdog-lib.mjs';
+import { evaluateAgentRestartIneffective } from './restart-ineffective-detector.mjs';
 import {
   ctxRoot, listAgentNames, lastHeartbeatMs, lastCronFireMs, recordHbObservation, resolveInterval, applyTrust,
   tickSurfaceState, restartDisposition, pidChangedReset, escalationGate, escalationMessage, holdAlertGate,
@@ -225,6 +226,30 @@ async function main() {
         fleetTrustedCount, trusted: trust[name].trusted });
     }
   }
+
+  // --- SELF-HEAL-GUARD-02: restart-ineffective backstop (ADDITIVE / escalation-only) ---
+  // Independent of the reap loop above; NEVER restarts. Structural, auth-mode-agnostic signal
+  // (streak of daemon stale_restarts that spawned FRESH sessions but produced NO heartbeat
+  // advance = restart demonstrably isn't recovering the agent — e.g. the 2026-07-13 IR auth-loss
+  // loop that marched crash_count to 8). A restart cannot fix not-logged-in / credit-hold / 429,
+  // so we do NOT restart — we page PD + file a [HUMAN] re-auth task, once per episode (latch
+  // cleared when the heartbeat advances). Classifier is validated against restart-ineffective-
+  // golden.json (shared with the daemon-internal .ts guard = anti-divergence).
+  for (const name of Object.keys(agents)) {
+    if (!SAFE_NAME.test(name)) continue;
+    const stA = state.agents[name] || (state.agents[name] = {});
+    let ri;
+    try { ri = evaluateAgentRestartIneffective(root, name, nowMs); }
+    catch { continue; }                                   // never crash the reap cron
+    if (!ri.ineffective) { stA.restartIneffAlerted = false; continue; }  // off-episode: reset latch
+    appendShadowLog(root, { ts: new Date(nowMs).toISOString(), mode: MODE, agent: name,
+      action: 'restart-ineffective', disposition: `RESTART-INEFFECTIVE (streak=${ri.streak}, label=${ri.label})`, verdict: ri });
+    if (!stA.restartIneffAlerted) {
+      escalateRestartIneffective(root, MODE, name, ri);   // shadow-safe (escalationGate inside)
+      stA.restartIneffAlerted = true;                     // page-once per episode
+    }
+  }
+
   saveState(root, state);
   console.log(`[wedge-watchdog] mode=${MODE} evaluated=${names.length} acted=${acted.length}${acted.length ? ' [' + acted.join(',') + ']' : ''}`);
 }
@@ -258,6 +283,31 @@ function escalate(root, mode, name, reasonType, detailMs, verdict) {
   try {
     execFileSync('cortextos', ['bus', 'send-message', 'platform-director', 'high',
       `[wedge-watchdog] ${body} Trace: ${verdict ? JSON.stringify(verdict.trace).slice(0, 300) : ''}`], { timeout: 15000 });
+  } catch { /* best-effort */ }
+  return true;
+}
+
+// SELF-HEAL-GUARD-02 escalation — shadow-safe by the same escalationGate as escalate(): in
+// shadow it LOGS a WOULD-ESCALATE line (no PD ping, no task); only armed pages + files the
+// [HUMAN] re-auth task. NEVER restarts (a restart can't fix the restart-ineffective classes).
+function escalateRestartIneffective(root, mode, name, verdict) {
+  if (!SAFE_NAME.test(name)) return false;   // defense-in-depth (SEC-WEDGE-ARGV)
+  const isAuth = verdict.label === 'not-logged-in';
+  const cause = isAuth ? 'not-logged-in — the session lost its login (needs RE-LOGIN; a restart cannot fix a lost login)'
+    : verdict.label === 'rate-limit' ? 'rate-limit — pause until it clears (a restart re-hits it)'
+    : 'unknown cause — needs eyes (restart is demonstrably not recovering it)';
+  const body = `RESTART-INEFFECTIVE: "${name}" — ${verdict.streak} consecutive daemon stale_restarts spawned fresh sessions but the heartbeat never advanced. Cause: ${cause}. Restart is NOT recovering it; needs ${isAuth ? 'human re-login' : 'investigation'}, not another restart.`;
+  if (!escalationGate(mode)) {               // SHADOW-PURITY: log would-escalate, no ping/no task
+    appendShadowLog(root, { ts: new Date().toISOString(), mode, agent: name, action: 'restart-ineffective-escalate', disposition: `WOULD-ESCALATE (restart-ineffective/${verdict.label}, shadow — no PD ping / no task)`, reason: body });
+    return false;
+  }
+  try {
+    execFileSync('cortextos', ['bus', 'send-message', 'platform-director', 'high', `[wedge-watchdog] ${body}`], { timeout: 15000 });
+  } catch { /* best-effort */ }
+  try {
+    const title = `[HUMAN] Re-auth ${name}: restart-ineffective (${verdict.label})`;
+    const desc = `SELF-HEAL-GUARD-02 wedge-watchdog fired: ${verdict.streak} consecutive daemon stale_restarts spawned FRESH sessions but the heartbeat never advanced — restart is not recovering "${name}" (structural, auth-mode-agnostic signal; label=${verdict.label}). ${isAuth ? 'Session shows not-logged-in ("Please run /login" / API Usage Billing) — RE-LOGIN the agent session; a restart will NOT fix a lost login.' : 'Cause not classified from stdout — investigate rate-limit / credit-hold / other restart-cannot-fix condition.'} Recovery = re-auth/credential refresh; the heartbeat then resumes and this guard auto-clears.`;
+    execFileSync('cortextos', ['bus', 'create-task', '--', title, '--desc', desc, '--priority', 'high'], { timeout: 15000 });
   } catch { /* best-effort */ }
   return true;
 }
