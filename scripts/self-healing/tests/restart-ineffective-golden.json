@@ -1,0 +1,128 @@
+{
+  "_comment": "LOCKED golden vector for SELF-HEAL-GUARD-02 restart-ineffective classifier. Both the daemon-internal (.ts) and OOP wedge-watchdog (.mjs) implementations MUST produce the expected verdict for every case. N=3. Inputs are RAW artifact content (parse identically). hb_advances = list of ts at which the heartbeat value changed (advanced).",
+  "N": 3,
+  "cases": [
+    {
+      "name": "1-ir-like-fire",
+      "desc": "IR-class: >=3 consecutive stale_restarts, all NEW session-ids, zero hb advance after the run started -> FIRE, labelled not-logged-in.",
+      "restarts_log": [
+        "[2026-07-13T03:07:16Z] WATCHDOG: stale_restart crash_count=3",
+        "[2026-07-13T04:18:33Z] WATCHDOG: stale_restart crash_count=4",
+        "[2026-07-13T05:20:48Z] WATCHDOG: stale_restart crash_count=5"
+      ],
+      "crashes_log": [
+        "2026-07-13T03:07:18Z type=crash reason=none session=376da52c-3170-4d5a-b992-188c9c70bfdf last_task=alive",
+        "2026-07-13T04:18:37Z type=crash reason=none session=b1b3bcf1-8a61-43c5-8114-50b25a340f35 last_task=alive",
+        "2026-07-13T05:20:49Z type=crash reason=none session=db6cae1f-85bd-4110-8306-002e6b05610b last_task=alive"
+      ],
+      "hb_advances": ["2026-07-13T03:00:00Z"],
+      "stdout_current_session": "Opus 4.8 (1M context) · API Usage Billing\nNot logged in · Please run /login",
+      "expected": {
+        "ineffective": true,
+        "streak": 3,
+        "newestSessionId": "db6cae1f-85bd-4110-8306-002e6b05610b",
+        "label": "not-logged-in"
+      }
+    },
+    {
+      "name": "2-recovery-mid-run-no-fire",
+      "desc": "2 restarts, then hb ADVANCES (recovery), then 1 more restart. streak counts only restarts after the LAST hb advance = 1 -> no fire, streak resets.",
+      "restarts_log": [
+        "[2026-07-13T03:00:00Z] WATCHDOG: stale_restart crash_count=3",
+        "[2026-07-13T04:00:00Z] WATCHDOG: stale_restart crash_count=4",
+        "[2026-07-13T06:00:00Z] WATCHDOG: stale_restart crash_count=5"
+      ],
+      "crashes_log": [
+        "2026-07-13T03:00:01Z type=crash reason=none session=aaaa1111-0000-0000-0000-000000000001 last_task=alive",
+        "2026-07-13T04:00:01Z type=crash reason=none session=bbbb2222-0000-0000-0000-000000000002 last_task=alive",
+        "2026-07-13T06:00:01Z type=crash reason=none session=cccc3333-0000-0000-0000-000000000003 last_task=alive"
+      ],
+      "hb_advances": ["2026-07-13T02:00:00Z", "2026-07-13T05:30:00Z"],
+      "stdout_current_session": "Opus 4.8 · Claude Max",
+      "expected": {
+        "ineffective": false,
+        "streak": 1,
+        "newestSessionId": "cccc3333-0000-0000-0000-000000000003",
+        "label": "n/a"
+      }
+    },
+    {
+      "name": "3-spared-long-turn-no-fire",
+      "desc": "A busy heavy agent spared by Gate-A/B2: NO watchdog restart entries accumulate -> streak 0 -> no fire. Guarantees a legit long turn cannot trip the guard (count only ACTUAL restarts).",
+      "restarts_log": [],
+      "crashes_log": [],
+      "hb_advances": ["2026-07-13T03:00:00Z"],
+      "stdout_current_session": "Opus 4.8 · Claude Max (working)",
+      "expected": {
+        "ineffective": false,
+        "streak": 0,
+        "newestSessionId": null,
+        "label": "n/a"
+      }
+    },
+    {
+      "name": "4-reap-failure-different-class-no-fire",
+      "desc": "3 restart attempts but the SAME session-id persists (reap NOT working). Precondition reapWorking=false -> this trigger does NOT fire (reap-failure is a distinct class; must not be conflated).",
+      "restarts_log": [
+        "[2026-07-13T03:00:00Z] WATCHDOG: stale_restart crash_count=3",
+        "[2026-07-13T04:00:00Z] WATCHDOG: stale_restart crash_count=4",
+        "[2026-07-13T05:00:00Z] WATCHDOG: stale_restart crash_count=5"
+      ],
+      "crashes_log": [
+        "2026-07-13T03:00:01Z type=crash reason=none session=dead0000-0000-0000-0000-00000000dead last_task=alive",
+        "2026-07-13T04:00:01Z type=crash reason=none session=dead0000-0000-0000-0000-00000000dead last_task=alive",
+        "2026-07-13T05:00:01Z type=crash reason=none session=dead0000-0000-0000-0000-00000000dead last_task=alive"
+      ],
+      "hb_advances": ["2026-07-13T02:00:00Z"],
+      "stdout_current_session": "",
+      "expected": {
+        "ineffective": false,
+        "streak": 3,
+        "newestSessionId": "dead0000-0000-0000-0000-00000000dead",
+        "label": "reap-failure-not-this-class"
+      }
+    },
+    {
+      "name": "5a-boundary-N-minus-1-no-fire",
+      "desc": "Exactly N-1 (=2) consecutive stale_restarts, distinct sessions, no hb advance -> streak 2 -> no fire.",
+      "restarts_log": [
+        "[2026-07-13T03:00:00Z] WATCHDOG: stale_restart crash_count=3",
+        "[2026-07-13T04:00:00Z] WATCHDOG: stale_restart crash_count=4"
+      ],
+      "crashes_log": [
+        "2026-07-13T03:00:01Z type=crash reason=none session=1111aaaa-0000-0000-0000-000000000001 last_task=alive",
+        "2026-07-13T04:00:01Z type=crash reason=none session=2222bbbb-0000-0000-0000-000000000002 last_task=alive"
+      ],
+      "hb_advances": ["2026-07-13T02:00:00Z"],
+      "stdout_current_session": "Not logged in · Please run /login",
+      "expected": {
+        "ineffective": false,
+        "streak": 2,
+        "newestSessionId": "2222bbbb-0000-0000-0000-000000000002",
+        "label": "n/a"
+      }
+    },
+    {
+      "name": "5b-boundary-N-fire",
+      "desc": "Exactly N (=3) consecutive stale_restarts, distinct sessions, no hb advance -> streak 3 -> FIRE. Unrecognized stdout -> escalate as unknown cause (never silent).",
+      "restarts_log": [
+        "[2026-07-13T03:00:00Z] WATCHDOG: stale_restart crash_count=3",
+        "[2026-07-13T04:00:00Z] WATCHDOG: stale_restart crash_count=4",
+        "[2026-07-13T05:00:00Z] WATCHDOG: stale_restart crash_count=5"
+      ],
+      "crashes_log": [
+        "2026-07-13T03:00:01Z type=crash reason=none session=1111aaaa-0000-0000-0000-000000000001 last_task=alive",
+        "2026-07-13T04:00:01Z type=crash reason=none session=2222bbbb-0000-0000-0000-000000000002 last_task=alive",
+        "2026-07-13T05:00:01Z type=crash reason=none session=3333cccc-0000-0000-0000-000000000003 last_task=alive"
+      ],
+      "hb_advances": ["2026-07-13T02:00:00Z"],
+      "stdout_current_session": "some unrelated output with no known signature",
+      "expected": {
+        "ineffective": true,
+        "streak": 3,
+        "newestSessionId": "3333cccc-0000-0000-0000-000000000003",
+        "label": "unknown-needs-eyes"
+      }
+    }
+  ]
+}
