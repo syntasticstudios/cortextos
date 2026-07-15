@@ -85,6 +85,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CTX_FRAMEWORK_ROOT/scripts/self-healing/tool-trace-hook.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
