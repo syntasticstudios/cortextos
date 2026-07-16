@@ -34,12 +34,6 @@
       "prompt": "Daily strategic drift check. Evaluate whether agent work is drifting away from: pharmacy utility, Cannametrics foundation, end-to-end care loop readiness. Check if output is tilting too heavily toward doctor-only workflows. Report drift indicators to platform-director. Escalate to user only if material drift detected. Use format: Context, Observed pattern, Why it matters, Risk level, Recommendation, Decision needed. cortextos bus update-cron-fire daily-strategic-drift --interval 1440"
     },
     {
-      "name": "daily-integration-health",
-      "type": "recurring",
-      "cron": "23 15 * * *",
-      "prompt": "Daily integration health check. Check: Cannaleo availability/routing dependency, HiGreen availability/feed health, QES dependency status, webhook response reliability, known callback failures, sync freshness. Alert platform-director if sustained error rate >15% for 30+ min on core workflow. Alert both if >25% or compliance/routing/data-integrity/security issues. cortextos bus update-cron-fire daily-integration-health --interval 1440"
-    },
-    {
       "name": "daily-cannametrics-foundation",
       "type": "recurring",
       "cron": "37 17 * * *",
@@ -98,12 +92,6 @@
       "type": "cron",
       "cron": "25 6 * * *",
       "prompt": "Security secret-leak tripwire (SYS-SECLEAK-01). Run: bash $CTX_FRAMEWORK_ROOT/scripts/self-healing/secret-leak-scan.sh . Exit 0 = CLEAN -> SILENT, send NO message. Exit 2 = probe-blind -> SILENT. Exit 1 = LEAK FOUND -> route the script summary (key-TYPE + file path + count ONLY; NEVER any secret value; use SINGLE quotes, no backticks/dollar-paren) to BOTH platform-director and devops-monitor via cortextos bus send-message platform-director high '<summary>' and cortextos bus send-message devops-monitor high '<summary>'. ALWAYS end: cortextos bus update-cron-fire secret-leak-scan --interval 1440 . Cadence DAILY (relaxed from 6h on 2026-06-30: prevention leg task_1782687826424 completed; wrapper passes literal argv since initial release + SO-10 behavioral directive live; tripwire now maintenance-cadence). Linked: umbrella task_1782687955176, build task_1782688249239."
-    },
-    {
-      "name": "stripe-restart-drag-timer",
-      "type": "cron",
-      "cron": "13 0 * * *",
-      "prompt": "STRIPE-RESTART DRAG-TIMER (one-shot semantics via date-guard; PD-authorized 2026-07-01 msg 1782888665345). STEP 0: cortextos bus update-heartbeat alive. STEP 1 DATE-GUARD: if the current UTC date is BEFORE 2026-07-03, do NOTHING further and end (silent no-op tick). STEP 2 (on/after 2026-07-03): CHECK the two gate tasks via `cortextos bus list-tasks --format json` — task_1782755603748_77510253 (HUMAN Stripe key-creation) and task_1782755603625_52114235 (STRIPE-ROT). GATE-LIFTED if task_1782755603748_77510253 status==completed OR task_1782755603625_52114235 status!=blocked: send NO message. ELSE (both still gated: HUMAN not-completed AND STRIPE-ROT still blocked): message platform-director ONCE, SINGLE-QUOTED body, no backticks/dollar (SO-10): cortextos bus send-message platform-director normal 'DRAG-TIMER FIRED (Stripe restart decouple): the Stripe key-creation gate has not lifted in 4 days (baseline 06-29). Per your decouple-if-drags decision, the held restart bundle (6 benefits: daemon-runtime convergence + PR #668 + PR #667 + state-fix a/b + cron-injection recovery + registry single-source) should now be re-framed to the Founder as a DECOUPLED independent ask in a monitored lull, rather than sitting silently bundled-behind-Stripe. Restart is still Founder-OK-gated; this only stops it waiting on Stripe indefinitely. Your decision to re-frame to Founder.' STEP 3 SELF-REMOVE (whether gate-lifted or fired — this is one-shot): remove the stripe-restart-drag-timer entry from BOTH the worktree config.json crons array AND the live crons.json crons array so it does not re-fire. Do NOT surface anything to the Founder directly."
     },
     {
       "name": "decision-latency-capture",
