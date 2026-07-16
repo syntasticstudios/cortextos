@@ -2321,12 +2321,16 @@ busCommand
   .option('--prompt <p>', 'New prompt text')
   .option('--enabled <bool>', 'Enable (true) or disable (false) the cron')
   .option('--desc <d>', 'New description')
-  .action(async (agent: string, name: string, opts: { interval?: string; cronExpr?: string; prompt?: string; enabled?: string; desc?: string }) => {
+  .option('--exec-mode <mode>', "Execution tier: 'pty' (default), 'shell' (Tier-S, zero-LLM), or 'headless' (reserved)")
+  .option('--command <cmd>', "Shell command to run when --exec-mode=shell (must include its own update-cron-fire)")
+  .option('--force-exec-mode', 'Override the escalation-verb guard when setting --exec-mode to shell/headless')
+  .action(async (agent: string, name: string, opts: { interval?: string; cronExpr?: string; prompt?: string; enabled?: string; desc?: string; execMode?: string; command?: string; forceExecMode?: boolean }) => {
     try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
 
     const rawSchedule = opts.interval ?? opts.cronExpr;
-    if (!rawSchedule && opts.prompt === undefined && opts.enabled === undefined && opts.desc === undefined) {
-      console.error('Error: at least one of --interval, --cron-expr, --prompt, --enabled, or --desc is required.');
+    if (!rawSchedule && opts.prompt === undefined && opts.enabled === undefined && opts.desc === undefined
+        && opts.execMode === undefined && opts.command === undefined) {
+      console.error('Error: at least one of --interval, --cron-expr, --prompt, --enabled, --desc, --exec-mode, or --command is required.');
       process.exit(1);
     }
 
@@ -2348,8 +2352,25 @@ busCommand
     if (opts.desc !== undefined) {
       patch.description = opts.desc;
     }
+    if (opts.execMode !== undefined) {
+      if (opts.execMode !== 'pty' && opts.execMode !== 'shell' && opts.execMode !== 'headless') {
+        console.error(`Error: --exec-mode must be 'pty', 'shell', or 'headless', got '${opts.execMode}'.`);
+        process.exit(1);
+      }
+      patch.execMode = opts.execMode;
+    }
+    if (opts.command !== undefined) {
+      patch.command = opts.command;
+    }
 
-    const ok = updateCronDef(agent, name, patch);
+    let ok: boolean;
+    try {
+      ok = updateCronDef(agent, name, patch, opts.forceExecMode === true);
+    } catch (err) {
+      // Exec-mode classification guard (or other set-time validation) rejected.
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
     if (!ok) {
       console.error(`Error: cron '${name}' not found for agent '${agent}'.`);
       process.exit(1);
