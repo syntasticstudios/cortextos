@@ -46,12 +46,6 @@
       "prompt": "Read skills/provider-change-review/SKILL.md and execute the weekly provider documentation and change review. Detect external changes that could break integrations. MANDATORY LAST STEP: cortextos bus update-cron-fire provider-change-review --interval 168h && cortextos bus update-heartbeat alive"
     },
     {
-      "name": "experiment-normalization-drift",
-      "type": "cron",
-      "cron": "29 5 */3 * *",
-      "prompt": "Read .claude/skills/autoresearch/SKILL.md and execute the experiment loop for normalization-drift cycle. MANDATORY LAST STEP: cortextos bus update-cron-fire experiment-normalization-drift --interval 72h && cortextos bus update-heartbeat alive"
-    },
-    {
       "name": "stale-offer-cleanup",
       "type": "cron",
       "cron": "34 5 * * *",
