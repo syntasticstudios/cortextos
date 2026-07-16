@@ -239,24 +239,93 @@ export function removeCron(agentName: string, name: string): boolean {
 }
 
 /**
+ * Escalation verbs that indicate a cron's prompt carries hidden
+ * judgment/escalation logic. A cron whose prompt contains any of these should
+ * NOT be silently shell-tiered (COST-LEVER-B3) — moving it to Tier-S/H would
+ * skip that reasoning. Matched case-insensitively as substrings.
+ */
+const EXEC_MODE_ESCALATION_VERBS = ['send-message', 'send-telegram', 'platform-director'];
+
+/**
+ * Set-time classification guard for COST-LEVER-B3.
+ *
+ * When a cron is being moved to a non-PTY exec mode (`'shell'` or `'headless'`),
+ * scan its (post-patch) prompt for escalation verbs. If any is present the cron
+ * may have hidden judgment/escalation logic and should not be silently tiered
+ * down — return an error message UNLESS `force` is set.
+ *
+ * NOTE: escalation-carrying crons (e.g. keychain-oauth-refresh, whose script
+ * itself alerts platform-director on failure) are EXPECTED to require `force`,
+ * because the daemon now owns that failure alert for shell mode.
+ *
+ * This is a SET-TIME validation only — it is never on the fire-time hot path.
+ *
+ * @returns `null` if the change is allowed; an error string if it is rejected.
+ */
+export function validateExecMode(
+  patch: Partial<CronDefinition>,
+  existing: CronDefinition,
+  force: boolean = false,
+): string | null {
+  // Only guard when the patch actually SETS a non-pty exec mode.
+  const nextMode = patch.execMode;
+  if (nextMode !== 'shell' && nextMode !== 'headless') {
+    return null;
+  }
+
+  // A shell cron with no command can never run — hard misconfig, NOT
+  // force-overridable. Catch it here rather than alerting on every fire.
+  if (nextMode === 'shell') {
+    const command = patch.command ?? existing.command;
+    if (!command) {
+      return `Refusing to set execMode='shell' on cron '${existing.name}': no command available. ` +
+        `Pass the shell command via --command in the same call (it must include its own update-cron-fire).`;
+    }
+  }
+
+  if (force) return null;
+
+  // Prompt after the patch is applied (patch may also update the prompt).
+  const prompt = (patch.prompt ?? existing.prompt ?? '').toLowerCase();
+  const hit = EXEC_MODE_ESCALATION_VERBS.find(v => prompt.includes(v));
+  if (hit) {
+    return `Refusing to set execMode='${nextMode}' on cron '${existing.name}': its prompt contains the escalation verb '${hit}', ` +
+      `which may hide judgment/escalation logic that a shell/headless tier would skip. ` +
+      `Re-run with force (--force-exec-mode) if this cron is genuinely mechanical and its failure escalation is owned elsewhere.`;
+  }
+  return null;
+}
+
+/**
  * Patch an existing cron definition with new field values.
  *
  * Merges `patch` into the matching cron object using `Object.assign` semantics
  * (shallow merge).  The `name` field in `patch` is ignored — the cron is
  * looked up by the `name` parameter and the stored name is never changed.
  *
+ * COST-LEVER-B3 guard: when `patch` sets `execMode` to `'shell'` or `'headless'`
+ * and the cron's prompt contains an escalation verb, the change is REJECTED
+ * (throws) unless `force` is true. See {@link validateExecMode}.
+ *
+ * @throws Error when the exec-mode classification guard rejects the change.
  * @returns `true` if the cron was found and updated; `false` if it did not exist.
  */
 export function updateCron(
   agentName: string,
   name: string,
-  patch: Partial<CronDefinition>
+  patch: Partial<CronDefinition>,
+  force: boolean = false,
 ): boolean {
   return withFileLockSync(lockDirFor(agentName), () => {
     const existing = readCrons(agentName);
     const idx = existing.findIndex(c => c.name === name);
     if (idx === -1) {
       return false;
+    }
+    // Set-time classification guard (COST-LEVER-B3).
+    const guardError = validateExecMode(patch, existing[idx], force);
+    if (guardError) {
+      throw new Error(guardError);
     }
     const updated = existing.map((c, i) =>
       i === idx ? { ...c, ...patch, name: c.name } : c

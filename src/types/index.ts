@@ -477,6 +477,65 @@ export interface CronDefinition {
    * @default false (manual fire is allowed by default — opt-out model)
    */
   manualFireDisabled?: boolean;
+
+  // ------------------------------------------------------------------
+  // COST-LEVER-B3 — mechanical-tick execution mode (Tier-S / Tier-H).
+  // ------------------------------------------------------------------
+
+  /**
+   * Execution tier for this cron. Selects HOW the daemon runs the fire.
+   *
+   * This is an EXPLICIT, per-cron classification set by an operator — it is
+   * NEVER inferred from the prompt and NEVER auto-demoted. Absent means the
+   * default `'pty'` behaviour (inject the prompt into the agent's persistent
+   * Opus PTY as an LLM turn).
+   *
+   * Values:
+   *   - `'pty'` (default when absent) — inject `prompt` into the agent PTY.
+   *     This is the classic behaviour: an LLM turn with full session context.
+   *   - `'shell'` — Tier-S, ZERO-LLM. The daemon runs {@link command} directly
+   *     via `/bin/bash -lc` with the agent's env, records nothing to the
+   *     transcript, and captures exit code + output. Qualifies only for purely
+   *     mechanical ticks (run a script, then `update-cron-fire`) that read no
+   *     live session state. Any failure is escalated to platform-director by
+   *     the daemon (the PTY agent no longer observes the tick).
+   *   - `'headless'` — RESERVED for a future PR (Tier-H: `claude -p --model …`).
+   *     NOT YET IMPLEMENTED: the dispatcher logs a warning and falls back to
+   *     `'pty'` when it encounters this value, so it degrades safely.
+   *
+   * @default 'pty'
+   * @example 'shell'
+   */
+  execMode?: 'pty' | 'headless' | 'shell';
+
+  /**
+   * The exact shell command the daemon runs when {@link execMode} === `'shell'`.
+   * REQUIRED for shell mode (a shell cron with no `command` is a misconfig — the
+   * daemon logs an error and alerts platform-director rather than firing).
+   *
+   * The command MUST include its own fire-recording call, mirroring exactly what
+   * the equivalent PTY agent prompt would have run, e.g.:
+   *   `cortextos bus update-cron-fire <name> --interval <n>`
+   * Fire-recording is NOT performed by the daemon for shell mode — the command
+   * owns it (as well as any `log-event` / `update-heartbeat` side effects). It
+   * is run with the agent's full env (see the shared `buildAgentCtxEnv` helper),
+   * so all `cortextos bus …` subprocess calls resolve the right instance/org.
+   *
+   * Ignored when `execMode` is absent or `'pty'`.
+   *
+   * @example "cortextos-src-watch && cortextos bus update-cron-fire src-watch --interval 30m"
+   */
+  command?: string;
+
+  /**
+   * RESERVED for the future headless (Tier-H) mode — the model the daemon would
+   * pass to `claude -p --model <model>`. UNUSED for now: the `'headless'` value
+   * is not yet implemented and falls back to `'pty'`, so this field has no
+   * effect. Documented here so the schema is forward-stable across the split PR.
+   *
+   * @example "haiku"
+   */
+  model?: string;
 }
 
 // ---------------------------------------------------------------------------

@@ -510,6 +510,15 @@ export class AgentProcess {
     return this.config;
   }
 
+  /**
+   * Get the resolved CtxEnv for this agent (live reference).
+   * Used by the Tier-S shell-exec cron path to build the same CTX_ / secrets
+   * environment the PTY session runs with (via `buildAgentCtxEnv`).
+   */
+  getEnv(): CtxEnv {
+    return this.env;
+  }
+
   // --- Private methods ---
 
   /**

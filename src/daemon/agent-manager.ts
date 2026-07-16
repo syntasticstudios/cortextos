@@ -15,7 +15,9 @@ import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHi
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn as spawnChild } from 'child_process';
+import { buildAgentCtxEnv } from '../pty/agent-env.js';
+import { sendMessage } from '../bus/message.js';
 import {
   listAgentPidFiles,
   classifyOrphan,
@@ -1130,6 +1132,23 @@ export class AgentManager {
     }
 
     const onFire = async (cron: CronDefinition): Promise<void> => {
+      // COST-LEVER-B3: branch on the cron's declared execution mode.
+      // Default (absent) = 'pty', the classic PTY-injection path below.
+      const mode = cron.execMode ?? 'pty';
+      if (mode === 'shell') {
+        // Tier-S: run the command directly in the daemon (zero LLM).
+        // fireShellCron handles ALL its own errors + failure alerts and never
+        // throws, so a shell-cron failure cannot break the scheduler.
+        await this.fireShellCron(agentName, cron);
+        return;
+      }
+      if (mode === 'headless') {
+        // Tier-H is reserved for a later PR. Degrade safely to the PTY path so
+        // a cron mis-tagged 'headless' still fires (as an LLM turn) rather than
+        // silently no-op'ing.
+        console.log(`[daemon] cron "${cron.name}" execMode=headless not yet implemented — falling back to pty`);
+      }
+
       const prompt = cron.prompt ?? `[cron] ${cron.name} fired`;
       // Salt with the fire timestamp so MessageDedup (which hashes the last 100
       // injects) does not reject identical cron prompts on subsequent fires.
@@ -1154,6 +1173,177 @@ export class AgentManager {
 
     const count = scheduler.getNextFireTimes().length;
     console.log(`[daemon] Loaded ${count} external cron(s) for agent "${agentName}" from crons.json`);
+  }
+
+  /**
+   * COST-LEVER-B3 (Tier-S): run a shell-exec cron directly in the daemon —
+   * ZERO LLM. The daemon spawns `cron.command` with the agent's full env,
+   * captures exit code + output, and (only on failure) escalates to
+   * platform-director. Fire-recording (`update-cron-fire`) is the command's
+   * responsibility — the daemon does not record fires for shell mode.
+   *
+   * SAFETY: this method NEVER throws. A thrown error would be treated by the
+   * scheduler as a dispatch failure; instead every error path is handled here
+   * and surfaced via the mandatory PD failure alert. Misconfig (no `command`,
+   * agent not resolvable) alerts and returns without crashing the scheduler.
+   */
+  private async fireShellCron(agentName: string, cron: CronDefinition): Promise<void> {
+    const DEFAULT_TIMEOUT_MS = 300_000; // 5 min
+    const MAX_OUTPUT_BYTES = 8 * 1024; // cap buffered stdout+stderr to ~8KB
+
+    if (!cron.command) {
+      // Misconfig: execMode==='shell' with no command to run.
+      console.error(`[daemon] shell-cron "${cron.name}" for "${agentName}" has no command — misconfigured, skipping`);
+      this.alertShellCronFailure(agentName, cron.name, 'misconfig', 'execMode=shell but no command field set');
+      return;
+    }
+
+    // Resolve the agent entry to obtain its CtxEnv + AgentConfig.
+    const entry = this.agents.get(agentName);
+    if (!entry) {
+      console.error(`[daemon] shell-cron "${cron.name}": agent "${agentName}" not in registry — cannot resolve env, skipping`);
+      this.alertShellCronFailure(agentName, cron.name, 'misconfig', 'agent not found in daemon registry');
+      return;
+    }
+
+    let agentEnv: CtxEnv;
+    let agentConfig: AgentConfig;
+    try {
+      agentEnv = entry.process.getEnv();
+      agentConfig = entry.process.getConfig();
+    } catch (err) {
+      console.error(`[daemon] shell-cron "${cron.name}": failed to read agent env/config: ${err}`);
+      this.alertShellCronFailure(agentName, cron.name, 'misconfig', 'could not resolve agent env/config');
+      return;
+    }
+
+    // Build env: process.env base + the shared CTX_*/secrets map (same helper
+    // the PTY path uses, so the shell cron sees an identical env surface).
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      ...buildAgentCtxEnv(agentEnv, agentConfig),
+    };
+    const cwd = agentConfig.working_directory || agentEnv.agentDir || agentEnv.frameworkRoot;
+
+    // Run the command, capturing a bounded tail of stdout+stderr and enforcing
+    // a timeout. Resolves with the outcome — never rejects.
+    const outcome = await new Promise<{ ok: boolean; code: number | null; timedOut: boolean; output: string }>((resolve) => {
+      let child: ReturnType<typeof spawnChild>;
+      try {
+        child = spawnChild('/bin/bash', ['-lc', cron.command as string], { env, cwd });
+      } catch (err) {
+        resolve({ ok: false, code: null, timedOut: false, output: `spawn error: ${err instanceof Error ? err.message : String(err)}` });
+        return;
+      }
+
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+      let timedOut = false;
+
+      // Keep only the last MAX_OUTPUT_BYTES of each stream.
+      const capTail = (buf: string): string =>
+        buf.length > MAX_OUTPUT_BYTES ? buf.slice(buf.length - MAX_OUTPUT_BYTES) : buf;
+
+      child.stdout?.on('data', (d: Buffer) => { stdout = capTail(stdout + d.toString()); });
+      child.stderr?.on('data', (d: Buffer) => { stderr = capTail(stderr + d.toString()); });
+
+      const combinedTail = (): string => capTail(`${stdout}${stderr ? `\n[stderr] ${stderr}` : ''}`);
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        // SIGTERM first, then SIGKILL if it does not exit promptly.
+        try { child.kill('SIGTERM'); } catch { /* already gone */ }
+        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, 5_000);
+      }, DEFAULT_TIMEOUT_MS);
+
+      child.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ ok: false, code: null, timedOut, output: `${combinedTail()}\nprocess error: ${err.message}`.trim() });
+      });
+
+      child.on('close', (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (timedOut) {
+          resolve({ ok: false, code, timedOut: true, output: combinedTail() });
+        } else {
+          resolve({ ok: code === 0, code, timedOut: false, output: combinedTail() });
+        }
+      });
+    });
+
+    if (outcome.ok) {
+      console.log(`[daemon] shell-cron "${cron.name}" for "${agentName}" ok (exit 0)`);
+      return;
+    }
+
+    // Failure: log + mandatory PD alert.
+    const reason = outcome.timedOut
+      ? `timeout after ${DEFAULT_TIMEOUT_MS}ms`
+      : `exit ${outcome.code ?? 'null'}`;
+    console.error(`[daemon] shell-cron "${cron.name}" for "${agentName}" FAILED (${reason})`);
+    this.alertShellCronFailure(
+      agentName,
+      cron.name,
+      outcome.timedOut ? 'timeout' : (outcome.code ?? 'null'),
+      outcome.output,
+    );
+  }
+
+  /**
+   * Sanitize a captured shell-cron output tail before it goes into a bus
+   * message. Strips anything that looks like a secret (KEY=VALUE tokens),
+   * collapses newlines, and truncates to a short tail. Defensive against
+   * leaking env values or credentials that a failing script may have echoed.
+   */
+  private sanitizeShellCronOutput(raw: string): string {
+    if (!raw) return '(no output)';
+    return raw
+      // Neutralize shell metacharacters (backtick, $) so a downstream consumer
+      // that re-emits this body into a shell cannot be injected — failure output
+      // is exactly when odd chars surface. SO-10 defense-in-depth.
+      .replace(/[`$]/g, '#')
+      // Drop KEY=VALUE-looking tokens (env values, credentials) entirely.
+      .replace(/\b[A-Za-z_][A-Za-z0-9_]*=\S+/g, '[redacted]')
+      // Collapse whitespace/newlines so the message body stays single-line.
+      .replace(/\s+/g, ' ')
+      .trim()
+      // Keep only a short tail so the alert stays readable.
+      .slice(-400) || '(no output)';
+  }
+
+  /**
+   * Send the mandatory high-priority platform-director alert for a failed
+   * shell-cron. Uses the in-process bus `sendMessage` primitive (atomic JSON
+   * write, no shell involved).
+   *
+   * SO-10 SAFETY: even though `sendMessage` writes JSON directly (no shell
+   * eval), downstream readers may re-emit this body into a shell. So the body
+   * is built with NO backticks, NO `$(...)`, NO unescaped `$VAR`, and the
+   * sanitized output tail has KEY=VALUE-looking secrets stripped. Best-effort:
+   * an alerting failure must never break the scheduler.
+   */
+  private alertShellCronFailure(
+    agentName: string,
+    cronName: string,
+    codeOrKind: number | string,
+    rawOutput: string,
+  ): void {
+    const tail = this.sanitizeShellCronOutput(rawOutput);
+    // Single-line, no shell metacharacters. `exit=<code>` doubles as the
+    // timeout/misconfig channel.
+    const body = `[tier-s shell-cron FAILED] agent=${agentName} cron=${cronName} exit=${codeOrKind} — ${tail}. Check daemon logs.`;
+    try {
+      const paths = resolvePaths(agentName, this.instanceId, this.resolveAgentOrg(agentName));
+      // from = the owning agent (the tick belongs to it); to = platform-director.
+      sendMessage(paths, agentName, 'platform-director', 'high', body);
+    } catch (err) {
+      console.error(`[daemon] shell-cron "${cronName}": PD failure-alert send failed: ${err}`);
+    }
   }
 
   /**

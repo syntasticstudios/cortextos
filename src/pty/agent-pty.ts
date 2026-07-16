@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
+import { buildAgentCtxEnv, shouldDisable1MContext } from './agent-env.js';
 
 // node-pty types
 interface IPty {
@@ -62,116 +63,15 @@ export class AgentPTY {
 
     const cwd = this.config.working_directory || this.env.agentDir || process.cwd();
 
-    // Build environment variables for the PTY process
+    // Build environment variables for the PTY process.
+    // The base env (process-env passthrough, `getBaseEnv`) stays here; the
+    // cortextOS-specific CTX_*/secrets/aliases/guards map is built by the shared
+    // `buildAgentCtxEnv` helper so the Tier-S shell-exec path reuses the exact
+    // same derivation and can never drift from the PTY env.
     const ptyEnv: Record<string, string> = {
       ...this.getBaseEnv(),
-      CTX_INSTANCE_ID: this.env.instanceId,
-      CTX_ROOT: this.env.ctxRoot,
-      CTX_FRAMEWORK_ROOT: this.env.frameworkRoot,
-      CTX_AGENT_NAME: this.env.agentName,
-      CTX_ORG: this.env.org,
-      CTX_AGENT_DIR: this.env.agentDir,
-      CTX_PROJECT_ROOT: this.env.projectRoot,
-      // Backward compat
-      CRM_AGENT_NAME: this.env.agentName,
-      CRM_TEMPLATE_ROOT: this.env.frameworkRoot,
+      ...buildAgentCtxEnv(this.env, this.config),
     };
-
-    // Source org-level shared secrets (orgs/{org}/secrets.env).
-    // These are shared across all agents in the org: OPENAI_KEY, APIFY_TOKEN, GEMINI_API_KEY, etc.
-    // Agent .env is loaded after and overrides org values — agent-specific keys win.
-    if (this.env.org && this.env.projectRoot) {
-      const orgEnvFile = join(this.env.projectRoot, 'orgs', this.env.org, 'secrets.env');
-      if (existsSync(orgEnvFile)) {
-        const content = readFileSync(orgEnvFile, 'utf-8');
-        for (const line of content.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
-          const eqIdx = trimmed.indexOf('=');
-          if (eqIdx > 0) {
-            ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-          }
-        }
-      }
-    }
-
-    // Source agent .env file (overrides org secrets.env for same key names).
-    // Contains agent-specific secrets: BOT_TOKEN, CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN.
-    const agentEnvFile = join(this.env.agentDir, '.env');
-    if (existsSync(agentEnvFile)) {
-      const content = readFileSync(agentEnvFile, 'utf-8');
-      for (const line of content.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const eqIdx = trimmed.indexOf('=');
-        if (eqIdx > 0) {
-          ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-        }
-      }
-    }
-
-    // Add convenience CTX_* aliases used throughout agent templates.
-    // CTX_TELEGRAM_CHAT_ID: alias for CHAT_ID from the agent's .env
-    if (ptyEnv['CHAT_ID']) {
-      ptyEnv['CTX_TELEGRAM_CHAT_ID'] = ptyEnv['CHAT_ID'];
-    }
-    // CTX_TIMEZONE: from config.json timezone field, falls back to system TZ
-    const configTimezone = this.config.timezone;
-    if (configTimezone) {
-      ptyEnv['CTX_TIMEZONE'] = configTimezone;
-      ptyEnv['TZ'] = configTimezone; // also set TZ so date/time system calls use correct zone
-    } else if (process.env.TZ) {
-      ptyEnv['CTX_TIMEZONE'] = process.env.TZ;
-    }
-    // Daemon-managed sessions never need in-process auto-update — SDK updates happen
-    // via npm at daemon-restart-time. Without this, agents can freeze for >30 min
-    // in a "Checking for updates" animation loop, burning stdout with 99-byte ticks
-    // and producing no agent work. Observed on BA/FE/PO sessions (2026-05-26).
-    ptyEnv['CLAUDE_CODE_DISABLE_AUTOUPDATE'] = 'true';
-    ptyEnv['DISABLE_AUTOUPDATER'] = 'true';
-    // FIX #3 (2026-05-26): disable claude-code auto-update check that freezes sessions
-    // in update-check loop. Observed BA/FE/PO stuck in "Checking for updates" for >30min
-    // while burning 99 bytes stdout (pure UI animation, no agent work).
-    // Daemon-managed sessions never need in-process auto-update — we control SDK updates
-    // via npm at daemon-restart-time.
-    ptyEnv['CLAUDE_CODE_DISABLE_AUTOUPDATE'] = 'true';
-    ptyEnv['DISABLE_AUTOUPDATER'] = 'true';
-
-    // ┌─ SYS-1M-PREVENT: BEST-EFFORT FORWARD-GUARD; NO-OP ON CURRENT CC (v2.1.162)
-    // │  because auto-1M is OPUS-ONLY there. DETECT (agent-process.ts handleExit)
-    // └─ is the LOAD-BEARING, VERSION-AGNOSTIC guard. Do NOT treat this as active
-    //    prevention — keep this label so a future refactor knows it is a no-op now
-    //    and does not let it silently re-become a false-prevention.
-    // For an explicit non-Opus model with
-    // no .env choice already made, default CLAUDE_CODE_DISABLE_1M_CONTEXT=true to
-    // force the standard window. Honoured by current Claude Code (v2.1.162 reads
-    // it and disables 1M — see shouldDisable1MContext), but effectiveness against
-    // the original improver-1M incident is LIMITED, by design and by version:
-    //   - On v2.1.162 the auto-1M default is OPUS-ONLY; explicit Sonnet/Haiku do
-    //     not auto-1M, so this env-set is a NO-OP for the models it targets here.
-    //   - It only bites on a CC version that BOTH auto-1M's a non-Opus model AND
-    //     honours this var. v2.1.111 (the incident version) auto-1M'd Sonnet but
-    //     did NOT honour the var — improver's .env already had it set and still
-    //     looped; the effective fix was unpinning config.model (PR #62).
-    // So this is forward-looking belt-and-suspenders for a future CC regression.
-    // Set ONLY when the agent's .env (sourced above) did not already choose —
-    // opt-in/opt-out respected. The real guard if 1M ever gates is DETECT.
-    if (AgentPTY.shouldDisable1MContext(this.config, ptyEnv['CLAUDE_CODE_DISABLE_1M_CONTEXT'] !== undefined)) {
-      ptyEnv['CLAUDE_CODE_DISABLE_1M_CONTEXT'] = 'true';
-    }
-
-    // CTX_ORCHESTRATOR_AGENT: read from org context.json so agents can route to orchestrator
-    if (this.env.projectRoot && this.env.org) {
-      try {
-        const contextPath = join(this.env.projectRoot, 'orgs', this.env.org, 'context.json');
-        if (existsSync(contextPath)) {
-          const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
-          if (ctx.orchestrator) {
-            ptyEnv['CTX_ORCHESTRATOR_AGENT'] = ctx.orchestrator;
-          }
-        }
-      } catch { /* leave unset if context.json is missing or malformed */ }
-    }
 
     // Spawn the agent binary directly (no shell wrapper) — cross-platform, no shell escaping needed.
     // env is passed natively via node-pty options; no bash export commands required.
@@ -351,11 +251,10 @@ export class AgentPTY {
    * standard window.
    */
   static shouldDisable1MContext(config: AgentConfig, explicitSetting: boolean): boolean {
-    if (explicitSetting) return false;
-    if (!config.model) return false;
-    if (/opus/i.test(config.model)) return false;
-    if (/\[1m\]/i.test(config.model)) return false;
-    return true;
+    // Delegate to the shared implementation in agent-env.ts (single source of
+    // truth reused by the Tier-S shell-exec path). Kept as a static method for
+    // back-compat with existing callers and tests.
+    return shouldDisable1MContext(config, explicitSetting);
   }
 
   /**
