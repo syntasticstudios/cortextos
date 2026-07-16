@@ -19,6 +19,13 @@
 #             psql/mysql and any UNKNOWN command emit argv[0] alone, so token-2 —
 #             which for content-first commands is a URL / inline SQL / literal
 #             string — is structurally never recorded). Allowlist-not-denylist.
+#             SECOND-LEVEL allowlist: `cortextos bus` alone exposes ONE further
+#             token — the bus VERB (argv[2]: update-heartbeat/send-message/…), so
+#             the sig discriminates idle bookkeeping from working calls. For
+#             `cortextos bus <verb> …`, argv[2] is ALWAYS the safe CLI verb and
+#             content is ALWAYS argv[3+] (message bodies, task titles, activity
+#             text) which is NEVER captured — verb-token-only, default-closed
+#             beyond it. Extends the content-free invariant; does not breach it.
 #   • Read/Edit/Write/NotebookEdit → last-2 dir segments + extension (filename
 #             dropped); paths under PII-adjacent trees (task store, patient/
 #             clinical/anamnese/rezept) collapse to "<redacted>".
@@ -111,7 +118,20 @@ case "$TOOL" in
       sub=$(printf '%s' "$RAW" | awk '{for(i=1;i<=NF;i++){if($i ~ /^[A-Za-z_][A-Za-z0-9_]*=/)continue; if(!seen){seen=1;continue} print $i; exit}}' 2>/dev/null)
       case "$sub" in
         ""|-*) SIG="$b" ;;          # no subcommand or an option flag → argv[0] alone
-        *) SIG="$b $sub" ;;
+        *)
+          SIG="$b $sub"
+          # SECOND-LEVEL allowlist (ONLY 'cortextos bus'): expose the bus VERB token
+          # (argv[2]) so idle bookkeeping (update-heartbeat/check-inbox/update-cron-fire)
+          # separates from working calls. argv[2] is ALWAYS the safe CLI verb; content
+          # is ALWAYS argv[3+] and is NEVER read. Default-closed beyond the verb token.
+          if [ "$b" = "cortextos" ] && [ "$sub" = "bus" ]; then
+            verb=$(printf '%s' "$RAW" | awk '{c=0;for(i=1;i<=NF;i++){if($i ~ /^[A-Za-z_][A-Za-z0-9_]*=/)continue; c++; if(c==3){print $i; exit}}}' 2>/dev/null)
+            case "$verb" in
+              ""|-*) : ;;                  # no verb / option flag → keep 'cortextos bus'
+              *) SIG="$b bus:$verb" ;;      # e.g. 'cortextos bus:update-heartbeat'
+            esac
+          fi
+          ;;
       esac
     else
       SIG="$b"                        # default-closed: unknown/content-first cmd → argv[0] only
