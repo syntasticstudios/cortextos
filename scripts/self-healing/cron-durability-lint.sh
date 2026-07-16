@@ -11,28 +11,41 @@
 #   3. UNIGNORED — the script is not under a gitignored path (.gitignore 'orgs/*/agents/*' agent-dir zone)
 #   4. IN-CONFIG — the cron def lives in config.json, not only in the live crons.json registry
 #
-# EFFECTIVE CONFIG SoT = the MAIN-CHECKOUT config.json (dirname of git-common-dir), NOT the
-# worktree copy. The daemon loads cron config from the main checkout + runtime crons.json; the
-# worktree config.json is a SEPARATE on-disk file (not symlinked). A worktree-only config edit
-# reads "clean" against the worktree but the daemon ignores it → the cron re-registers on restart.
-# (Learned 2026-07-13, SA daily-integration-health false-clean cost 3 days.) This is the INVERSE of
-# the crontab-.sh lane, where the CLI symlink routes EXECUTION into the worktree. So: config_crons()
-# reads the MAIN checkout; we additionally read the worktree copy purely to flag divergence.
+# DURABILITY SoT = ORIGIN/MAIN committed config (the O axis). A re-clone / re-provision reads the
+# COMMITTED origin/main config.json — NOT the local main-checkout working copy, which may be stale
+# (behind origin/main) or dirty. Four config states per cron (learned 2026-07-13, cannametrics
+# git-fetch-first flag after PR #123):
+#   O = origin/main committed config      — what a re-clone / re-provision gets = the durability SoT
+#   M = main-checkout WORKING COPY config — local checkout freshness only (may lag origin/main)
+#   W = worktree / daemon-runtime config  — pending-merge (durable once merged to origin/main)
+#   R = runtime crons.json                — what is actually scheduled right now
+#
+# DAEMON RELOAD MODEL (code-verified, cron-migration.ts + agent-manager.ts:489): config→crons.json
+# migration is ONE-TIME, gated by a per-agent marker in ctxRoot state. A PLAIN restart SKIPS
+# migration and reads the persistent crons.json (R) directly — it never re-reads config.json, so a
+# stale/behind main-checkout (M) can NOT strand or drop a live cron on restart. config.json only
+# drives crons.json on a MIGRATION EVENT (first-ever boot / `migrate-crons --force` / fresh
+# re-provision), which does a wholesale REPLACE from the config read. Hence the durability charter =
+# re-clone/re-provision (reads O), NOT restart; and M-staleness is COSMETIC except under --force.
+# (INVERSE of the crontab-.sh lane, where the CLI symlink routes EXECUTION into the worktree.)
 #
 # Classifications per cron:
 #   PASS          — all checks clean
-#   FAIL          — a re-clone would break this cron (abs path / untracked / ignored / config-orphan)
-#   PENDING-SYNC  — source (config.json) is durable+portable, but the LIVE crons.json copy still
-#                   carries an abs path (expected transient while the framework-root worktree
-#                   hasn't yet merged the relocate PR — NOT a durability break)
-#   DIVERGENCE    — the worktree config.json and the effective MAIN-CHECKOUT config.json disagree on
-#                   this cron's presence (worktree-only add/remove not synced to the copy the daemon
-#                   loads). Non-failing WARN — surfaces the silent no-op that reads "clean" locally.
+#   FAIL          — a re-clone would break this cron (abs path / untracked / ignored / config-orphan
+#                   = in R but in NEITHER O nor W)
+#   PENDING-SYNC  — source config is durable+portable, but the LIVE crons.json copy still carries an
+#                   abs path (expected transient while the worktree hasn't merged the relocate PR)
+#   DIVERGENCE    — origin/main (O) and worktree (W) config disagree on this cron's presence
+#                   (W-only = not yet committed → re-clone-now would drop it; O-only = worktree
+#                   dropped it). Non-failing WARN — durability-relevant but usually pending-merge.
+#   STALE-MAIN    — local main-checkout working copy (M) disagrees with origin/main (O): the local
+#                   checkout is behind/ahead. Non-failing advisory — COSMETIC for a plain restart
+#                   (daemon reads runtime crons.json), only matters under migrate --force / re-provision.
 #   SELF-REMOVE-TARGET — the cron's self-remove/one-shot prompt instructs editing the WORKTREE
-#                   config.json; since the daemon loads main-checkout, that strands a leftover that
-#                   re-registers on restart. Non-failing WARN — fix before it strands.
+#                   config.json; a worktree-only self-remove strands a leftover on a migration event.
+#                   Non-failing WARN — fix before it strands.
 #
-# Exit: 0 if no FAIL, 1 if any FAIL. PENDING-SYNC / DIVERGENCE / SELF-REMOVE-TARGET do not fail.
+# Exit: 0 if no FAIL, 1 if any FAIL. PENDING-SYNC / DIVERGENCE / STALE-MAIN / SELF-REMOVE-TARGET do not fail.
 #
 # Run:  bash "$CTX_FRAMEWORK_ROOT/scripts/self-healing/cron-durability-lint.sh"
 set -euo pipefail
@@ -68,6 +81,26 @@ def main_checkout_root():
     return FWROOT  # last resort: behave as before
 
 MAINROOT = main_checkout_root()
+
+def git_at(root, *a):
+    return subprocess.run(["git", "-C", root, *a], capture_output=True, text=True)
+
+# Freshen origin/main so the O axis reflects the true remote, not a stale local ref. cannametrics
+# 2026-07-13: the main-checkout hadn't pulled #123, so the LOCAL origin/main ref lagged and the lint
+# false-flagged a durably-committed cron. Best-effort + non-fatal — a fetch failure (offline / CI /
+# no network) just falls back to whatever local origin/main ref exists.
+git("fetch", "--quiet", "origin", "main")
+
+# How far the local main-checkout working copy (M) trails committed origin/main (O). Cosmetic for a
+# plain restart (see header), surfaced so a lagging local checkout is visible, not mysterious.
+def main_checkout_behind():
+    head = git_at(MAINROOT, "rev-parse", "HEAD").stdout.strip()
+    if not head:
+        return None
+    r = git("rev-list", "--count", f"{head}..origin/main")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+MAIN_BEHIND = main_checkout_behind()
 
 def tracked_main(rel):
     return git("cat-file", "-e", f"origin/main:{rel}").returncode == 0
@@ -108,6 +141,31 @@ def config_crons(agent, root):
             return {}
     return {}
 
+def agent_config_rel(agent):
+    # repo-relative path of the agent's config.json (same in any checkout); used to read the
+    # COMMITTED origin/main copy via `git show`. Probe both checkouts in case the agent dir only
+    # exists in one working tree.
+    for root in (MAINROOT, FWROOT):
+        for cf in glob.glob(os.path.join(root, "orgs", "*", "agents", agent, "config.json")):
+            return os.path.relpath(cf, root)
+    return None
+
+def origin_config_crons(agent):
+    # O axis — the COMMITTED origin/main config. A fresh re-clone / re-provision reads THIS (its
+    # ctxRoot has no migration marker, so it migrates from origin/main config), NOT the local
+    # working copy. This is the true re-clone durability SoT. Read via `git show`, not the on-disk
+    # file, so a stale/dirty local checkout can't skew the verdict.
+    rel = agent_config_rel(agent)
+    if not rel:
+        return {}
+    r = git("show", f"origin/main:{rel}")
+    if r.returncode != 0:
+        return {}   # config.json not committed to origin/main at all
+    try:
+        return {c["name"]: c for c in (json.loads(r.stdout).get("crons", []) or [])}
+    except Exception:
+        return {}
+
 def registered_crons(agent):
     cj = os.path.join(STATE, agent, "crons.json")
     if not os.path.exists(cj):
@@ -123,44 +181,58 @@ agents = sorted(os.listdir(STATE)) if os.path.isdir(STATE) else []
 results = []  # (agent, cron, status, detail)
 
 for agent in agents:
-    cfg = config_crons(agent, MAINROOT)   # EFFECTIVE SoT — the config the daemon actually loads
-    wt  = config_crons(agent, FWROOT)     # worktree copy — read only to flag divergence
+    O   = origin_config_crons(agent)      # committed origin/main — the re-clone/re-provision SoT
+    M   = config_crons(agent, MAINROOT)   # main-checkout working copy — local freshness only
+    W   = config_crons(agent, FWROOT)     # worktree / daemon-runtime — pending-merge
     reg = registered_crons(agent)
-    for name in sorted(set(cfg) | set(reg) | set(wt)):
-        cfg_c, reg_c = cfg.get(name), reg.get(name)
-        in_main, in_wt, in_reg = name in cfg, name in wt, name in reg
+    for name in sorted(set(O) | set(M) | set(W) | set(reg)):
+        reg_c = reg.get(name)
+        in_O, in_M, in_W, in_reg = name in O, name in M, name in W, name in reg
 
-        # TRUE config-orphan (hard FAIL): live in crons.json but in NEITHER config.json
-        # (main or worktree) — no def anywhere, dropped by re-clone / migrate --force, undurable.
-        if in_reg and not in_main and not in_wt:
-            results.append((agent, name, "FAIL", "config-orphan: in crons.json but in NO config.json (main or worktree) — dropped by re-clone / migrate --force"))
+        # TRUE config-orphan (hard FAIL): live in crons.json but committed NOWHERE a re-provision
+        # would read — not in origin/main (O) and not in the worktree/pending-merge config (W). A
+        # re-clone / migrate --force would drop it. M (the local main-checkout working copy) does
+        # NOT save it: a re-clone reads committed origin/main, not a dirty/stale local file.
+        if in_reg and not in_O and not in_W:
+            results.append((agent, name, "FAIL", "config-orphan: in crons.json but in NEITHER origin/main config (O) nor worktree config (W) — dropped by re-clone / migrate --force"))
             continue
 
-        # worktree-vs-main divergence: someone edited one config.json but not the other.
-        # Non-failing WARN — the silent no-op that reads "clean" locally while the daemon keeps
-        # loading the un-edited main-checkout copy. This is NOT a hard FAIL: a worktree-only add
-        # may be a legit cron pending merge to main; a main-only entry is still durably loaded.
-        if in_main != in_wt:
-            only = ("main-checkout only (worktree drop not synced → daemon still loads it from main; retire not complete)"
-                    if in_main else
-                    "worktree only (present in worktree config + maybe runtime, but NOT in effective main-checkout / origin config → re-clone would drop it; durablize or confirm pending-merge)")
-            results.append((agent, name, "DIVERGENCE", f"config.json worktree/main disagree: {only}"))
+        # O-vs-W divergence (durability-relevant, non-failing WARN): committed origin/main and the
+        # worktree/pending-merge config disagree. NOT a hard FAIL — a worktree-only add is usually a
+        # legit cron pending merge to main; an origin-only entry is still durably committed.
+        if in_O != in_W:
+            only = ("origin/main only (worktree config dropped it → if a COMPLETED retire, remove the entry from origin/main config too (commit the removal) so a re-provision doesn't re-create the retired cron; if unintended, the worktree branch is behind origin/main)"
+                    if in_O else
+                    "worktree only (in worktree config + maybe runtime, NOT yet committed to origin/main → a re-clone RIGHT NOW would drop it; durablize via merge to main or confirm pending-merge)")
+            results.append((agent, name, "DIVERGENCE", f"origin/main (O) vs worktree (W) config disagree: {only}"))
 
-        if not cfg_c:
-            # no EFFECTIVE (main-checkout) source cron to durability-check — daemon's effective
-            # config doesn't carry it. Already surfaced above (orphan or divergence). Skip checks.
+        # STALE-MAIN (non-failing advisory): the local main-checkout working copy (M) disagrees with
+        # committed origin/main (O). COSMETIC for a plain restart — migration is one-time/marker-gated
+        # and a plain restart reads runtime crons.json, never re-reading config.json, so a
+        # behind/ahead main-checkout can't strand or drop a live cron. Only bites under migrate
+        # --force / fresh re-provision on the stale local checkout. Fix = git -C <main-checkout> pull.
+        if in_O != in_M:
+            note = ("main-checkout working copy BEHIND origin/main (lacks a cron O carries — e.g. hasn't pulled the durablizing merge)"
+                    if in_O else
+                    "main-checkout working copy AHEAD of / diverged from origin/main (carries a cron not yet committed to origin/main)")
+            results.append((agent, name, "STALE-MAIN", f"local main-checkout vs origin/main disagree — {note}; cosmetic for plain restart (daemon reads runtime crons.json), only matters under migrate --force / re-provision"))
+
+        # Durability source to lint = what a re-provision actually reads: prefer committed origin/main
+        # (O), else the pending-merge worktree config (W). If neither carries it we already FAILed.
+        src_c = O.get(name) or W.get(name)
+        if not src_c:
             continue
 
-        cfg_prompt = (cfg_c or {}).get("prompt", "")
+        cfg_prompt = src_c.get("prompt", "")
         reg_prompt = (reg_c or {}).get("prompt", "")
 
         # SELF-REMOVE-TARGET (non-failing WARN): a self-remove/one-shot prompt that tells the agent
-        # to edit the WORKTREE config.json is latently broken — the daemon loads main-checkout, so a
-        # worktree-only self-remove strands a leftover that re-registers on restart. Catch it before
-        # it strands. (Backstop for the class SA flagged from stripe-restart-drag-timer.)
+        # to edit the WORKTREE config.json is latently broken — a worktree-only self-remove strands a
+        # leftover that re-appears on a migration event (first boot / --force / re-provision). Catch
+        # it before it strands. (Backstop for the class SA flagged from stripe-restart-drag-timer.)
         if SELFREMOVE_RE.search(cfg_prompt) and WORKTREE_CFG_RE.search(cfg_prompt):
             results.append((agent, name, "SELF-REMOVE-TARGET",
-                            "self-remove prompt targets WORKTREE config.json — must target main-checkout config + remove-cron/cron-delete (runtime), else leftover re-registers on restart"))
+                            "self-remove prompt targets WORKTREE config.json — must target main-checkout config + remove-cron/cron-delete (runtime), else leftover re-appears on a migration event"))
 
         # collect script refs from the config (source-of-truth) prompt
         cfg_abs  = set(ABS_RE.findall(cfg_prompt))
@@ -191,19 +263,24 @@ for agent in agents:
 fails     = [r for r in results if r[2] == "FAIL"]
 pending   = [r for r in results if r[2] == "PENDING-SYNC"]
 diverge   = [r for r in results if r[2] == "DIVERGENCE"]
+stalemain = [r for r in results if r[2] == "STALE-MAIN"]
 selfrem   = [r for r in results if r[2] == "SELF-REMOVE-TARGET"]
-# "scanned" = unique crons; a single cron can emit a DIVERGENCE/warn row plus a durability row
+# "scanned" = unique crons; a single cron can emit a DIVERGENCE/STALE-MAIN warn plus a durability row
 scanned   = len({(a, c) for a, c, _, _ in results})
 passes    = [r for r in results if r[2] == "PASS"]
 
 print("=== cron-durability-lint ===")
+if MAIN_BEHIND and MAIN_BEHIND != "0":
+    print(f"  (context) local main-checkout is {MAIN_BEHIND} commit(s) behind origin/main — cosmetic for plain restart; `git -C <main-checkout> pull` to freshen.")
 for a, c, s, d in results:
     if s == "PASS":
         continue
     print(f"  [{s}] {a}/{c}: {d}")
-print(f"\n{scanned} crons scanned | {len(passes)} PASS | {len(pending)} PENDING-SYNC | {len(diverge)} DIVERGENCE | {len(selfrem)} SELF-REMOVE-TARGET | {len(fails)} FAIL")
+print(f"\n{scanned} crons scanned | {len(passes)} PASS | {len(pending)} PENDING-SYNC | {len(diverge)} DIVERGENCE | {len(stalemain)} STALE-MAIN | {len(selfrem)} SELF-REMOVE-TARGET | {len(fails)} FAIL")
 if diverge:
-    print("NOTE — DIVERGENCE rows are non-failing warnings: worktree/main config.json disagree; sync the copy the daemon loads (main-checkout) before assuming a cron add/removal took effect.")
+    print("NOTE — DIVERGENCE rows are non-failing warnings: origin/main (O) and worktree (W) config disagree; merge to origin/main to durablize (or confirm pending-merge) before assuming a re-clone would carry the change.")
+if stalemain:
+    print("NOTE — STALE-MAIN rows are non-failing advisories: the local main-checkout working copy lags/leads origin/main; cosmetic for a plain restart (daemon reads runtime crons.json), only bites under migrate --force / re-provision. `git -C <main-checkout> pull`.")
 if selfrem:
     print("NOTE — SELF-REMOVE-TARGET rows are non-failing warnings: fix the cron prompt to self-remove from main-checkout config + runtime, not the worktree config.")
 if fails:
