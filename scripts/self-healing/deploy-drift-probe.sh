@@ -376,10 +376,38 @@ if declare -f crontab_symlink_status >/dev/null 2>&1; then
   CRONTAB_SIG="${SYM_STATUS%% *}:${CT_BYPASS_PATHS}"
 fi
 
+# --- 3f. BRANCH-DRIFT: the live worktree HEAD must stay on its tracking branch ---------
+# Incident 2026-07-13 (task_1783958670360): an agent ran `git checkout -b` INSIDE the live
+# objective-mclaren worktree during a PR build → the CLI symlink + daemon + crontab source
+# all silently drifted onto a feature branch, undetected for hours until a src-watch merge
+# conflict surfaced it. The live worktree must stay on EXPECTED_BRANCH. Standing guardrail:
+# agents build PRs in ISOLATED worktrees, NEVER checkout inside objective-mclaren. This dim
+# is detection-only (no mutation) and is ORTHOGONAL to the daemon-dist dims — a wrong branch
+# is a SoT-integrity fault regardless of dist state, so it also pages under a restart-hold mute.
+# Secondary: flag if the live tree has fallen behind origin/main beyond a small tolerance
+# (stale live daemon/CLI/crontab source — daemon-runtime is kept FF-current in normal ops).
+EXPECTED_BRANCH="daemon-runtime"
+BEHIND_THRESHOLD=40   # tunable: daemon-runtime may legitimately lag origin/main a little between syncs
+BRANCH_DRIFT="false"; BRANCH_SIG=""
+CUR_BRANCH=$(git -C "$FRAMEWORK_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+if [ -n "$CUR_BRANCH" ] && [ "$CUR_BRANCH" != "$EXPECTED_BRANCH" ]; then
+  BRANCH_DRIFT="true"
+  DETACHED_NOTE=""; [ "$CUR_BRANCH" = "HEAD" ] && DETACHED_NOTE=" (DETACHED HEAD)"
+  REASONS+=("BRANCH-DRIFT: live worktree $FRAMEWORK_ROOT is on branch '${CUR_BRANCH}'${DETACHED_NOTE}, NOT '${EXPECTED_BRANCH}' — the CLI symlink, daemon, and crontab source all run from here; an agent likely ran a checkout INSIDE the live worktree (agents must build PRs in ISOLATED worktrees). Restore: git -C $FRAMEWORK_ROOT checkout ${EXPECTED_BRANCH}")
+  BRANCH_SIG="branch:${CUR_BRANCH}"
+elif [ -n "$CUR_BRANCH" ] && [ -n "$REMOTE_SHA" ]; then
+  BEHIND=$(git -C "$FRAMEWORK_ROOT" rev-list --count HEAD..origin/main 2>/dev/null || echo "0")
+  if [ "${BEHIND:-0}" -gt "$BEHIND_THRESHOLD" ] 2>/dev/null; then
+    BRANCH_DRIFT="true"
+    REASONS+=("BRANCH-BEHIND: live worktree on '${EXPECTED_BRANCH}' is ${BEHIND} commits behind origin/main (> ${BEHIND_THRESHOLD}) — live daemon/CLI/crontab source is stale; sync origin/main into ${EXPECTED_BRANCH}")
+    BRANCH_SIG="behind:${BEHIND}"
+  fi
+fi
+
 DRIFT="false"
 if [ "$SOURCE_DRIFT" = "true" ] || [ "$RESTART_DRIFT" = "true" ] || [ "$SHA_STALE" = "true" ] \
    || [ "$DEPLOYED_DRIFT" = "true" ] || [ "$DEPLOYED_ORPHAN" = "true" ] \
-   || [ "$CRONTAB_DRIFT" = "true" ]; then
+   || [ "$CRONTAB_DRIFT" = "true" ] || [ "$BRANCH_DRIFT" = "true" ]; then
   DRIFT="true"
 fi
 
@@ -448,6 +476,10 @@ cat > "$TOPOLOGY_FILE" <<EOF
   "sha_stale": $SHA_STALE,
   "crontab_drift": $CRONTAB_DRIFT,
   "crontab_sig": "$CRONTAB_SIG",
+  "branch_drift": $BRANCH_DRIFT,
+  "current_branch": "$CUR_BRANCH",
+  "expected_branch": "$EXPECTED_BRANCH",
+  "branch_sig": "$BRANCH_SIG",
   "deployed_drift": $DEPLOYED_DRIFT,
   "deployed_orphan": $DEPLOYED_ORPHAN,
   "deployed_drift_files": $DEPLOYED_DRIFT_JSON,
@@ -498,7 +530,7 @@ if [ "$SOURCE_DRIFT" = "true" ] && declare -f source_drift_sig >/dev/null 2>&1; 
   SOURCE_SIG=$(source_drift_sig "$FRAMEWORK_ROOT" "$BUILD_SHA" "$REMOTE_SHA")
 fi
 
-DRIFT_KEY="src=${SOURCE_DRIFT};srcsig=${SOURCE_SIG};sha=${SHA_STALE};pid=${DAEMON_PID};dep=${DEPLOYED_SIG};hold=${RESTART_HOLD};holdmute=${RESTART_HOLD_MUTE};crontab=${CRONTAB_SIG}"
+DRIFT_KEY="src=${SOURCE_DRIFT};srcsig=${SOURCE_SIG};sha=${SHA_STALE};pid=${DAEMON_PID};dep=${DEPLOYED_SIG};hold=${RESTART_HOLD};holdmute=${RESTART_HOLD_MUTE};crontab=${CRONTAB_SIG};branch=${BRANCH_SIG}"
 LAST_KEY=$(cat "$MARKER" 2>/dev/null || echo "")
 
 # Restart-hold mute (section 4b): while the held daemon-process restart is Founder-gated
@@ -508,7 +540,7 @@ LAST_KEY=$(cat "$MARKER" 2>/dev/null || echo "")
 # daemon lag or a real restart always pages. Topology artifact records everything regardless.
 PAGE_DRIFT="$DRIFT"
 if [ "$RESTART_HOLD_MUTE" = "true" ]; then
-  if [ "$DEPLOYED_DRIFT" = "true" ] || [ "$DEPLOYED_ORPHAN" = "true" ] || [ "$SHA_STALE" = "true" ] || [ "$CRONTAB_DRIFT" = "true" ]; then
+  if [ "$DEPLOYED_DRIFT" = "true" ] || [ "$DEPLOYED_ORPHAN" = "true" ] || [ "$SHA_STALE" = "true" ] || [ "$CRONTAB_DRIFT" = "true" ] || [ "$BRANCH_DRIFT" = "true" ]; then
     PAGE_DRIFT="true"
   else
     PAGE_DRIFT="false"
@@ -527,7 +559,7 @@ if [ "$PAGE_DRIFT" = "true" ]; then
       "[deploy-drift-probe] ${PREFIX} ${SUMMARY}Detail: $TOPOLOGY_FILE" \
       2>/dev/null && log "escalated to platform-director" || log "WARNING: PD escalation failed"
     cortextos bus log-event action deploy_drift_detected warn \
-      --meta "{\"pid\":$DAEMON_PID,\"source_drift\":$SOURCE_DRIFT,\"restart_drift\":$RESTART_DRIFT,\"restart_hold\":$RESTART_HOLD,\"sha_stale\":$SHA_STALE,\"deployed_drift\":$DEPLOYED_DRIFT,\"deployed_orphan\":$DEPLOYED_ORPHAN}" 2>/dev/null || true
+      --meta "{\"pid\":$DAEMON_PID,\"source_drift\":$SOURCE_DRIFT,\"restart_drift\":$RESTART_DRIFT,\"restart_hold\":$RESTART_HOLD,\"sha_stale\":$SHA_STALE,\"deployed_drift\":$DEPLOYED_DRIFT,\"deployed_orphan\":$DEPLOYED_ORPHAN,\"branch_drift\":$BRANCH_DRIFT,\"current_branch\":\"$CUR_BRANCH\"}" 2>/dev/null || true
     echo "$DRIFT_KEY" > "$MARKER"
   else
     log "drift unchanged since last fire — escalation suppressed (idempotent)"
