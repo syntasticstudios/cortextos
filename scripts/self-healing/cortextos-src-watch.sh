@@ -198,13 +198,88 @@ echo "[cortextos-src-watch] Stale dist detected (built: ${BUILD_SHA:0:8}, origin
 # (and thus whether the rebuilt dist actually differs — gates the fleet broadcast below).
 BEFORE_MERGE=$(git rev-parse HEAD 2>/dev/null || echo "")
 
-# Merge origin/main into current branch (no-ff to preserve history).
-if ! git merge origin/main --no-edit 2>&1; then
-  echo "[cortextos-src-watch] ERROR: merge conflict on $LOCAL_BRANCH — manual resolution required" >&2
-  cortextos bus send-message platform-director high \
-    "[cortextos-src-watch] Merge conflict on $LOCAL_BRANCH — manual git merge origin/main needed in $REPO_ROOT" \
-    2>/dev/null || true
-  exit 1
+# Fast-forward origin/main into the current branch. --ff-only is a deliberate
+# live-worktree-safety guard: daemon-runtime is always behind-or-equal in normal
+# operation, so this FFs. If it ever UNEXPECTEDLY diverges (e.g. a branch got
+# checked out in the live worktree, cf. #122), --ff-only REFUSES rather than
+# silently creating a merge commit in the live worktree — which is exactly the
+# class of silent live-mutation the single-owner norm exists to prevent. The
+# refusal falls through to the analysis below and escalates (clean tree -> no
+# blockers -> escalate; dirty tree -> byte-identical still can't FF -> escalate).
+if ! git merge --ff-only origin/main 2>&1; then
+  # --- Byte-identical collision auto-resolve (single-owner, SILENT) ----------
+  # Recurring class: an agent applies a change (e.g. a cron-retire) as a LOCAL
+  # runtime self-remove to a config.json, AND the same change also lands via PR
+  # to origin/main. `git merge` then refuses ("Your local changes would be
+  # overwritten by merge") even though the working-tree content is BYTE-IDENTICAL
+  # to the merge target. Auto-resolve ONLY that case: restore byte-identical
+  # blockers to HEAD and retry. Any genuine (non-empty) delta still escalates.
+  # Locked single-owner norm w/ platform-director 2026-07-16 (msg bymlx):
+  # byte-identical -> resolve SILENTLY (no page); genuine delta -> escalate.
+  # Ref: task_1784195217378 (PD-endorsed).
+
+  # Defensive backstop: --ff-only above never STARTS a merge, so MERGE_HEAD
+  # cannot appear here today. But if the --ff-only guard is ever reverted to a
+  # plain merge, a real content conflict WOULD leave MERGE_HEAD — abort and
+  # escalate rather than fall through. (Worktree .git is a file, so use git, not
+  # a path.)
+  if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    git merge --abort 2>/dev/null || true
+    echo "[cortextos-src-watch] ERROR: real merge conflict (MERGE_HEAD) on $LOCAL_BRANCH — manual resolution required" >&2
+    cortextos bus send-message platform-director high \
+      "[cortextos-src-watch] Merge conflict on $LOCAL_BRANCH — manual git merge origin/main needed in $REPO_ROOT" \
+      2>/dev/null || true
+    exit 1
+  fi
+
+  # Blocking set = files locally-dirty AND changed by the incoming merge.
+  # (Dirty files NOT touched by the merge don't block it — leave them untouched
+  # to preserve runtime state like active-experiments.json.)
+  _INCOMING_LIST=$(mktemp 2>/dev/null || echo "/tmp/src-watch-incoming.$$")
+  git diff --name-only HEAD..origin/main 2>/dev/null | sort -u > "$_INCOMING_LIST"
+  BLOCKERS=$(git diff --name-only HEAD 2>/dev/null | sort -u | grep -Fxf "$_INCOMING_LIST" 2>/dev/null)
+  rm -f "$_INCOMING_LIST" 2>/dev/null || true
+
+  GENUINE_DELTA=""
+  RESOLVABLE=""
+  if [ -n "$BLOCKERS" ]; then
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      if [ -n "$(git diff origin/main -- "$f" 2>/dev/null)" ]; then
+        GENUINE_DELTA="$GENUINE_DELTA $f"   # working-tree != target: real local edit
+      else
+        RESOLVABLE="$RESOLVABLE $f"         # byte-identical to target: safe to restore
+      fi
+    done <<EOF
+$BLOCKERS
+EOF
+  fi
+
+  # No blockers found, or any genuine delta present -> escalate, do NOT auto-resolve.
+  if [ -z "$BLOCKERS" ] || [ -n "$GENUINE_DELTA" ]; then
+    echo "[cortextos-src-watch] ERROR: merge blocked on $LOCAL_BRANCH — genuine local delta on:${GENUINE_DELTA:- <no byte-identical blockers matched>} — manual resolution required" >&2
+    cortextos bus send-message platform-director high \
+      "[cortextos-src-watch] Merge conflict on $LOCAL_BRANCH — manual git merge origin/main needed in $REPO_ROOT (genuine local delta on:${GENUINE_DELTA:- unknown})" \
+      2>/dev/null || true
+    exit 1
+  fi
+
+  # All blockers byte-identical to origin/main — restore to HEAD and retry. SILENT.
+  echo "[cortextos-src-watch] byte-identical collision — auto-resolving (silent, single-owner): restore to HEAD:${RESOLVABLE}"
+  # shellcheck disable=SC2086
+  git checkout HEAD -- $RESOLVABLE 2>/dev/null || true
+  # --ff-only again: after restoring byte-identical blockers the branch must FF
+  # cleanly. If it still can't (abnormal divergence), refuse+escalate rather than
+  # create a merge commit in the live worktree.
+  if ! git merge --ff-only origin/main 2>&1; then
+    git merge --abort 2>/dev/null || true
+    echo "[cortextos-src-watch] ERROR: merge still failed after byte-identical auto-resolve on $LOCAL_BRANCH — manual resolution required" >&2
+    cortextos bus send-message platform-director high \
+      "[cortextos-src-watch] Merge conflict on $LOCAL_BRANCH persists after byte-identical auto-resolve — manual git merge origin/main needed in $REPO_ROOT" \
+      2>/dev/null || true
+    exit 1
+  fi
+  echo "[cortextos-src-watch] byte-identical collision RESOLVED — merge complete (no page; single-owner silent path)"
 fi
 
 # Rebuild dist.
