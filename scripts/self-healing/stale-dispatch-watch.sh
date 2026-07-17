@@ -41,10 +41,21 @@ stale = []
 for t in tasks:
     author = t.get("author", "") or t.get("created_by", "")
     assignee = t.get("assignee", "") or ""
+    title = t.get("title", "") or ""
     if author != "backend-architect":
         continue
     # Only flag tasks with no assignee or self-assigned
     if assignee and assignee not in ("", "backend-architect"):
+        continue
+    # Exclude human-valves and standing-records — NOT un-dispatched work (PD 2026-07-17,
+    # msg 1784276403801): assigned_to=human, [HUMAN]-titled, and [WATCH]-policy tasks are
+    # human-valves / standing monitors that reassign-task cannot hand to "human" (rejected
+    # as not-a-registry-agent), so they stay BA-assigned + tag-marked and false-flag weekly
+    # as chronic-known. Filter them so the watch surfaces only genuine dropped-dispatch.
+    if assignee == "human":
+        continue
+    _tu = title.upper()
+    if "[HUMAN]" in _tu or "[WATCH]" in _tu:
         continue
     created_raw = t.get("created_at", "") or ""
     if not created_raw:

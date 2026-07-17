@@ -87,6 +87,20 @@ WARN_FLOOR_MIN="${FLEET_HB_WARN_FLOOR_MIN:-90}"
 ALERT_FLOOR_MIN="${FLEET_HB_ALERT_FLOOR_MIN:-150}"
 WARN_MARGIN_MIN="${FLEET_HB_WARN_MARGIN_MIN:-60}"
 ALERT_FACTOR="${FLEET_HB_ALERT_FACTOR:-1.5}"
+# BUSY-SUPPRESSION WINDOW CAP (SYS-MASK-01, 2026-07-10): the busy-suppression window
+# used to be the FULL tripped staleness threshold (up to 360-480min for heavy agents).
+# That let a STALE burst of activity mask a wedge: the FE 2026-07-06 wedged HEARTBEAT
+# turn produced 1 message + touched fs at 18:14Z but never ran update-heartbeat (store
+# stayed frozen at 14:14Z); the watch read that 143min-old fs-touch as "work within the
+# 360min window" and SUPPRESSED — a heartbeat token that failed to bump the store is the
+# OPPOSITE of proof-of-life. A genuinely-busy agent produces CURRENT activity (stdout
+# streams live; work-turns are 15-25min), so proof-of-BUSY must be RECENT, not a stale
+# burst. Cap the suppression window at BUSY_WINDOW_MIN (~2x the longest normal work-turn):
+# activity older than this no longer masks, so the 143min FE wedge now surfaces. Idle-but-
+# alive heavy agents are unaffected — their 240min backstop keeps the store hb fresh so
+# they never become candidates in the first place. (Fixed cap, NOT interval-scaled: an
+# interval-scaled window would re-open the 240min hole for heavy agents.)
+BUSY_WINDOW_MIN="${FLEET_HB_BUSY_WINDOW_MIN:-60}"
 # Config root holding orgs/<org>/agents/<name>/config.json (heartbeat-cron source).
 # Prefer $CTX_FRAMEWORK_ROOT; else derive from this script's location (scripts/self-healing/
 # -> framework root is two dirs up) so it stays correct under re-clone/relocation.
@@ -146,7 +160,7 @@ trap 'rm -f "$TASKS_FILE"' EXIT
 cortextos bus list-tasks --format json > "$TASKS_FILE" 2>/dev/null || echo '[]' > "$TASKS_FILE"
 
 CTX_BASE="${CTX_ROOT:-$HOME/.cortextos/${CTX_INSTANCE_ID:-default}}"
-WARN_FLOOR_MIN="$WARN_FLOOR_MIN" ALERT_FLOOR_MIN="$ALERT_FLOOR_MIN" WARN_MARGIN_MIN="$WARN_MARGIN_MIN" ALERT_FACTOR="$ALERT_FACTOR" CONFIG_ROOT="$CONFIG_ROOT" RAW="$RAW" TASKS_FILE="$TASKS_FILE" STATE_FILE="$STATE_FILE" CTX_BASE="$CTX_BASE" python3 - <<'PY'
+WARN_FLOOR_MIN="$WARN_FLOOR_MIN" ALERT_FLOOR_MIN="$ALERT_FLOOR_MIN" WARN_MARGIN_MIN="$WARN_MARGIN_MIN" ALERT_FACTOR="$ALERT_FACTOR" BUSY_WINDOW_MIN="$BUSY_WINDOW_MIN" CONFIG_ROOT="$CONFIG_ROOT" RAW="$RAW" TASKS_FILE="$TASKS_FILE" STATE_FILE="$STATE_FILE" CTX_BASE="$CTX_BASE" python3 - <<'PY'
 import json, os, sys, datetime, glob, math
 
 # PER-AGENT interval-aware thresholds (SYS-WATCHDOG-CAL). Floors/margin/factor are the
@@ -155,6 +169,7 @@ warn_floor = float(os.environ["WARN_FLOOR_MIN"])
 alert_floor = float(os.environ["ALERT_FLOOR_MIN"])
 warn_margin = float(os.environ["WARN_MARGIN_MIN"])
 alert_factor = float(os.environ["ALERT_FACTOR"])
+busy_window_m = float(os.environ.get("BUSY_WINDOW_MIN", "60"))
 config_root = os.environ.get("CONFIG_ROOT", "")
 state_file = os.environ["STATE_FILE"]
 now = datetime.datetime.now(datetime.timezone.utc)
@@ -386,13 +401,20 @@ for ag in agents:
         status, bucket = "WARN", warns
     else:
         status, bucket = "OK", None
-    # ACTIVITY-CORROBORATION (the OUTCOME, WINDOW-RELATIVE): liveness = newest of
-    # {task-activity (bus-store), fs-mtime (context_status/stdout/state-dir)}. A candidate
-    # is SUPPRESSED (busy-not-frozen) only if it produced work WITHIN the staleness window
-    # it tripped (now - liveness < that threshold) — matching wedge B2. An agent whose LAST
-    # work is OLDER than the freeze (genuinely went quiet) still ALERTs; never spare on
-    # stale-old activity. Corroboration-blind (no source) -> do NOT suppress. NEVER auto-acts.
+    # ACTIVITY-CORROBORATION (the OUTCOME): liveness = newest of {task-activity (bus-store),
+    # fs-mtime (context_status/stdout/state-dir)}. A candidate is SUPPRESSED (busy-not-frozen)
+    # only if it produced work RECENTLY — within busy_window (SYS-MASK-01: a bounded cap, NOT
+    # the full tripped threshold). PROOF-OF-BUSY MUST BE CURRENT: a busy agent streams stdout
+    # live and turns are 15-25min, so genuine busy-ness shows activity within ~an hour. The old
+    # window (= the full tripped threshold, up to 360-480min) let a STALE burst mask a wedge —
+    # the FE 2026-07-06 wedged-HEARTBEAT turn's 143min-old fs-touch read as "within the 360min
+    # window" and wrongly suppressed. An agent whose LAST work is OLDER than busy_window (a
+    # wedged heartbeat that produced once then went silent, OR a genuinely-quiet agent) now
+    # ALERTs. Corroboration-blind (no source) -> do NOT suppress. NEVER auto-acts.
     threshold_for = alert_m if status == "ALERT" else (warn_m if status == "WARN" else None)
+    # Suppression window is capped at busy_window_m but never exceeds the tripped threshold
+    # (a WARN at warn_m<busy_window keeps the tighter warn_m so we don't spare past its own bar).
+    busy_window = min(busy_window_m, threshold_for) if threshold_for is not None else None
     live_dt = agent_activity.get(name)
     fs_dt = fs_activity_dt(name)
     if fs_dt is not None and (live_dt is None or fs_dt > live_dt):
@@ -400,12 +422,15 @@ for ag in agents:
     # frozen-note only on actual candidates (WARN/ALERT) — not on OK agents (avoids the
     # misleading "OK [frozen]" line; an OK agent simply hasn't ticked yet this window).
     note = " [frozen: hb unchanged since last fire]" if (frozen and bucket is not None) else ""
-    if bucket is not None and live_dt is not None and threshold_for is not None:
+    if bucket is not None and live_dt is not None and busy_window is not None:
         live_age_m = (now - live_dt).total_seconds() / 60.0
-        if live_age_m < threshold_for:
+        if live_age_m < busy_window:
             note = (f" -> SUPPRESSED busy (work-produced {live_age_m:.0f}min ago, "
-                    f"within the {threshold_for:.0f}min window — busy-not-frozen)")
-            status, bucket = "BUSY", None  # alive within the staleness window: do not alert
+                    f"within the {busy_window:.0f}min busy-window — busy-not-frozen)")
+            status, bucket = "BUSY", None  # produced CURRENT work: do not alert
+        else:
+            note = (f" [activity {live_age_m:.0f}min ago > {busy_window:.0f}min busy-window "
+                    f"-> NOT proof-of-life (stale burst / wedged-heartbeat class); surfacing]")
     lines.append(f"  {name}: hb {age_m:.0f}min old (WARN>{warn_m:.0f}, ALERT>{alert_m:.0f}; {mode}) -> {status}{note}")
     if bucket is not None:
         bucket.append({"agent": name, "hbAgeMin": round(age_m), "status": status,
