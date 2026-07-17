@@ -114,21 +114,26 @@ export function classifyPr(pr) {
 
       // Sha ended RED. Decide by the resolution SHA (generic — no check-name keying).
       const lastFailIdx = Math.max(...failures.map((r) => r.__i));
-      const successAfter = runs.some((r) => r.conclusion === 'success' && r.__i > lastFailIdx);
       const successBefore = runs.some((r) => r.conclusion === 'success' && r.__i < lastFailIdx);
+      const successAfter = runs.some((r) => r.conclusion === 'success' && r.__i > lastFailIdx);
 
-      if (successAfter) {
-        // Went green only AFTER this sha's last failure => a new commit was required.
-        // A same-sha success after the last failure would have made the terminal a success,
-        // so this success is necessarily on a later sha => 'new-sha'.
-        realGateFailures += 1;
-        realGateFailureByCheck[check] = (realGateFailureByCheck[check] || 0) + 1;
-        details.push({ check, sha, kind: 'real-gate-failure', failingRuns: failures.length, resolution: 'new-sha' });
-      } else if (successBefore) {
+      // Precedence matters: test successBefore (first-green-already-reached) FIRST. A sha that
+      // ended red AFTER the check first went green is a post-first-green regression EVEN IF it
+      // is later re-fixed (successAfter also true) — the cycle-to-FIRST-green already completed
+      // at that first green, so this must not inflate realGateFailuresBeforeFirstGreen. (If
+      // successAfter were tested first it would mis-count the green->break->refix case.)
+      if (successBefore) {
         // The check already went green earlier; this red is a post-first-green regression.
         // NOT a cycle-to-FIRST-green — excluded from the metric, reported separately.
         postGreenRegressions += 1;
         details.push({ check, sha, kind: 'post-green-regression', failingRuns: failures.length });
+      } else if (successAfter) {
+        // Never green before this sha's last failure, but green came AFTER => a new commit was
+        // required. A same-sha success after the last failure would have made the terminal a
+        // success, so this success is necessarily on a later sha => 'new-sha'.
+        realGateFailures += 1;
+        realGateFailureByCheck[check] = (realGateFailureByCheck[check] || 0) + 1;
+        details.push({ check, sha, kind: 'real-gate-failure', failingRuns: failures.length, resolution: 'new-sha' });
       } else {
         // Never green for this check => unresolved real failure.
         realGateFailures += 1;

@@ -85,6 +85,21 @@ describe('classifyPr — terminal state of the sha (review findings #2, #9)', ()
     expect(r.realGateFailures).toBe(0)
     expect(r.postGreenRegressions).toBe(1)
   })
+
+  it('green -> break -> RE-FIX (success A, fail B, success C) is a post-green regression, NOT a before-first-green failure (precedence regression)', () => {
+    // Regression guard for the precedence bug: first green already happened at A, so the B
+    // break is post-first-green even though C re-fixes it — must NOT inflate the metric.
+    const r = classifyPr({
+      number: 12,
+      runs: [
+        { check: 'Build', sha: A, conclusion: 'success', createdAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:00:02Z', runId: 1 },
+        { check: 'Build', sha: B, conclusion: 'failure', createdAt: '2026-01-01T01:00:00Z', completedAt: '2026-01-01T01:00:02Z', runId: 2 },
+        { check: 'Build', sha: 'c'.repeat(40), conclusion: 'success', createdAt: '2026-01-01T02:00:00Z', completedAt: '2026-01-01T02:00:02Z', runId: 3 },
+      ],
+    })
+    expect(r.realGateFailures).toBe(0)
+    expect(r.postGreenRegressions).toBe(1)
+  })
 })
 
 describe('classifyPr — real gate failure (needed a new commit)', () => {
