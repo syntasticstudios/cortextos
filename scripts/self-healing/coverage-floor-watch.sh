@@ -28,10 +28,17 @@ FLOOR_cbdPercent=89.0   # today 92.24 — ~3pp headroom over the manual-cohort f
 FLOOR_thcPercent=95.0   # today 98.37
 FLOOR_genetics=80.0     # today 84.01 — ~4pp headroom
 
+# Capture the probe exit code explicitly: under `set -e`, a non-zero npx exit
+# (transient prod auth/network) would otherwise kill the script HERE with exit 1
+# and no output — indistinguishable from a real BREACH and falsely routed to PD.
+# Route both a non-zero probe AND an empty response to the exit-2 probe-blind lane.
+set +e
 REPORT_JSON="$(cd "$SAAS_DIR" && npx convex run --prod functions/cannametrics:dataQualityReportPublic '{}' 2>/dev/null)"
+PROBE_EC=$?
+set -e
 
-if [ -z "$REPORT_JSON" ]; then
-  echo "COVERAGE-FLOOR-WATCH: ERROR — empty response from dataQualityReportPublic (prod auth / network?)" >&2
+if [ "$PROBE_EC" -ne 0 ] || [ -z "$REPORT_JSON" ]; then
+  echo "COVERAGE-FLOOR-WATCH: ERROR — probe failed (exit=$PROBE_EC) or empty response from dataQualityReportPublic (prod auth / network?)" >&2
   exit 2
 fi
 
