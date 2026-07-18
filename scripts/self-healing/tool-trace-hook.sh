@@ -103,9 +103,33 @@ redact_path() {
 SIG=""
 case "$TOOL" in
   Bash)
+    # OBSERV-01 post-cd fix: a monitoring/probe run as `cd DIR && realverb` would
+    # otherwise store sig=cd (navigation), hiding real work as idle. Split RAW on
+    # compound separators (&& ; ||), skip navigation-only leaders (cd/pushd/popd),
+    # and analyse the FIRST non-navigation segment so sig reflects the action, not
+    # the cd. Still token-level + allowlist-gated below → the PII invariant is
+    # unchanged (only argv[0]/subcommand/verb ever reach the sig, never content).
+    # Pure `cd DIR` (no real verb) falls back to RAW so sig stays "cd".
+    BSEG=$(printf '%s' "$RAW" | awk '
+      {
+        n=split($0, segs, /&&|;|\|\|/)
+        for(k=1;k<=n;k++){
+          s=segs[k]
+          gsub(/^[ \t]+/,"",s); gsub(/[ \t]+$/,"",s)
+          if(s=="") continue
+          m=split(s, toks, /[ \t]+/)
+          cmd=""
+          for(j=1;j<=m;j++){ if(toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) continue; cmd=toks[j]; break }
+          if(cmd=="") continue
+          sub(/.*\//,"",cmd)
+          if(cmd=="cd"||cmd=="pushd"||cmd=="popd") continue
+          print s; exit
+        }
+      }' 2>/dev/null)
+    [ -z "$BSEG" ] && BSEG="$RAW"
     # argv[0] = first token that is NOT a VAR=value env-assignment prefix.
     cmd0=""
-    for tok in $RAW; do
+    for tok in $BSEG; do
       case "$tok" in
         [A-Za-z_]*=*) continue ;;   # skip leading env assignments (VAR=val)
         *) cmd0="$tok"; break ;;
@@ -115,7 +139,7 @@ case "$TOOL" in
     b=$(basename "$cmd0" 2>/dev/null || echo sh)
     if is_structured_cli "$b"; then
       # subcommand = the next token after argv[0] (skip env prefixes + argv[0] itself)
-      sub=$(printf '%s' "$RAW" | awk '{for(i=1;i<=NF;i++){if($i ~ /^[A-Za-z_][A-Za-z0-9_]*=/)continue; if(!seen){seen=1;continue} print $i; exit}}' 2>/dev/null)
+      sub=$(printf '%s' "$BSEG" | awk '{for(i=1;i<=NF;i++){if($i ~ /^[A-Za-z_][A-Za-z0-9_]*=/)continue; if(!seen){seen=1;continue} print $i; exit}}' 2>/dev/null)
       case "$sub" in
         ""|-*) SIG="$b" ;;          # no subcommand or an option flag → argv[0] alone
         *)
@@ -125,7 +149,7 @@ case "$TOOL" in
           # separates from working calls. argv[2] is ALWAYS the safe CLI verb; content
           # is ALWAYS argv[3+] and is NEVER read. Default-closed beyond the verb token.
           if [ "$b" = "cortextos" ] && [ "$sub" = "bus" ]; then
-            verb=$(printf '%s' "$RAW" | awk '{c=0;for(i=1;i<=NF;i++){if($i ~ /^[A-Za-z_][A-Za-z0-9_]*=/)continue; c++; if(c==3){print $i; exit}}}' 2>/dev/null)
+            verb=$(printf '%s' "$BSEG" | awk '{c=0;for(i=1;i<=NF;i++){if($i ~ /^[A-Za-z_][A-Za-z0-9_]*=/)continue; c++; if(c==3){print $i; exit}}}' 2>/dev/null)
             case "$verb" in
               ""|-*) : ;;                  # no verb / option flag → keep 'cortextos bus'
               *) SIG="$b bus:$verb" ;;      # e.g. 'cortextos bus:update-heartbeat'
