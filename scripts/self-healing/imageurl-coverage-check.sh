@@ -10,7 +10,11 @@
 # tracks the historically highest non-zero coverage so a later drop fires exactly once.
 #
 # MECHANISM:
-#   - Read imageUrl coverage % from dataQualityReportPublic (auth-free, prod).
+#   - Read imageUrl coverage % from dataQualityFieldCoveragePublic (auth-free,
+#     prod). This is the bounded products-only variant (task_1784302829780): the
+#     former dataQualityReportPublic did FIVE big scans/tx and crossed the Convex
+#     system-op budget (timeout). The bounded variant returns the IDENTICAL
+#     full-population fieldCoverage.imageUrl — same scan, not a sample.
 #   - If coverage == 0: WIP — update last-checked, stay silent.
 #   - If coverage > 0: update the non-zero baseline. If this is LOWER than the prior
 #     non-zero baseline by >TOLERANCE pp: ALERT regression. Else CLEAR.
@@ -35,10 +39,10 @@ mkdir -p "$(dirname "$BASELINE_FILE")" 2>/dev/null || true
 # Tolerance in percentage points below the last known non-zero coverage.
 TOLERANCE="${IMAGEURL_COVERAGE_TOLERANCE:-5.0}"
 
-REPORT_JSON="$(cd "$SAAS_DIR" && npx convex run --prod functions/cannametrics:dataQualityReportPublic '{}' 2>/dev/null)"
+REPORT_JSON="$(cd "$SAAS_DIR" && npx convex run --prod functions/cannametrics:dataQualityFieldCoveragePublic '{}' 2>/dev/null)"
 
 if [ -z "$REPORT_JSON" ]; then
-  echo "IMAGEURL-COVERAGE-CHECK: ERROR — empty response from dataQualityReportPublic (prod auth / network?)" >&2
+  echo "IMAGEURL-COVERAGE-CHECK: ERROR — empty response from dataQualityFieldCoveragePublic (prod auth / network?)" >&2
   exit 2
 fi
 

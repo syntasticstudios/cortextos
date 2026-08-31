@@ -5,9 +5,17 @@
 # (zero_floor) and large NEW regressions (drop_trend >=30pp). It STRUCTURALLY misses
 # the cbd-396 class — a chronic, sub-30pp partial gap on a core field that never hits
 # 0% and has no "drop" to trend (cbd sat ~88% chronically during the bug). That class
-# is visible only in ABSOLUTE field coverage. dataQualityReportPublic computes exactly
-# that (full-catalog, point-in-time). This watch reads it on the SA health-monitoring
-# cadence and flags any core V2-gating field below a CALIBRATED floor.
+# is visible only in ABSOLUTE field coverage. dataQualityFieldCoveragePublic
+# computes exactly that (full-catalog, point-in-time). This watch reads it on the
+# SA health-monitoring cadence and flags any core V2-gating field below a
+# CALIBRATED floor.
+#
+# QUERY (task_1784302829780): reads dataQualityFieldCoveragePublic — a bounded
+# products-only variant. The former dataQualityReportPublic did FIVE big scans/tx
+# and crossed the Convex system-op budget (timeout -> floor watch blind). The
+# bounded variant returns the IDENTICAL full-population fieldCoverage + totalProducts
+# (same scan, same null tests, same pct math — NOT a sample), so the calibrated
+# floors below stay comparable across cycles.
 #
 # Floors are set with headroom BELOW today's steady-state (2026-06-16) and ABOVE the
 # genuine-null floor measured that day (full-catalog cbd-null ~396 = manual ~360 +
@@ -21,8 +29,8 @@ set -euo pipefail
 
 SAAS_DIR="${PHYTOMEDIC_SAAS_DIR:-/Users/arndt/phytomedic-saas}"
 
-# Calibrated floors (percent). Core V2-gating fields present in dataQualityReportPublic.
-# (category is NOT in dataQualityReportPublic.fieldCoverage — it stays with the per-sync
+# Calibrated floors (percent). Core V2-gating fields present in dataQualityFieldCoveragePublic.
+# (category is NOT in dataQualityFieldCoveragePublic.fieldCoverage — it stays with the per-sync
 #  detector only.) Today's steady-state in comments.
 FLOOR_cbdPercent=89.0   # today 92.24 — ~3pp headroom over the manual-cohort floor
 FLOOR_thcPercent=95.0   # today 98.37
@@ -33,12 +41,12 @@ FLOOR_genetics=80.0     # today 84.01 — ~4pp headroom
 # and no output — indistinguishable from a real BREACH and falsely routed to PD.
 # Route both a non-zero probe AND an empty response to the exit-2 probe-blind lane.
 set +e
-REPORT_JSON="$(cd "$SAAS_DIR" && npx convex run --prod functions/cannametrics:dataQualityReportPublic '{}' 2>/dev/null)"
+REPORT_JSON="$(cd "$SAAS_DIR" && npx convex run --prod functions/cannametrics:dataQualityFieldCoveragePublic '{}' 2>/dev/null)"
 PROBE_EC=$?
 set -e
 
 if [ "$PROBE_EC" -ne 0 ] || [ -z "$REPORT_JSON" ]; then
-  echo "COVERAGE-FLOOR-WATCH: ERROR — probe failed (exit=$PROBE_EC) or empty response from dataQualityReportPublic (prod auth / network?)" >&2
+  echo "COVERAGE-FLOOR-WATCH: ERROR — probe failed (exit=$PROBE_EC) or empty response from dataQualityFieldCoveragePublic (prod auth / network?)" >&2
   exit 2
 fi
 
