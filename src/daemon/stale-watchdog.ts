@@ -3,6 +3,7 @@ import { join } from 'path';
 import type { AgentManager } from './agent-manager.js';
 import { readAllHeartbeats, isHeartbeatStale } from '../bus/heartbeat.js';
 import { incrementCrashCount } from './crash-counter.js';
+import { classifyRestartIneffective } from './restart-ineffective.js';
 import { cronExecutionLogPathFor } from '../bus/crons-schema.js';
 import { ensureDir } from '../utils/atomic.js';
 import type { BusPaths, AgentConfig, CronExecutionLogEntry } from '../types/index.js';
@@ -400,6 +401,39 @@ export class StaleAgentWatchdog {
         continue;
       }
 
+      // --- Restart-ineffective guard (SELF-HEAL-GUARD-02) ---
+      // STRUCTURAL + auth-mode-AGNOSTIC: if the watchdog has already restarted this agent
+      // N times (each a fresh session = reap worked) with the heartbeat STILL frozen, the
+      // restart is demonstrably not fixing it — auth-loss / credit-hold / 429, none of which
+      // a restart CAN fix. Stop burning the crash budget toward a silent HALT: skip BOTH the
+      // crash-count increment and the restart. Self-resets structurally when the heartbeat
+      // advances (T0 = last_heartbeat moves forward → streak drops to 0 → normal supervision
+      // resumes). The out-of-process wedge-watchdog owns the escalation (page + [HUMAN]
+      // re-auth task once/episode); this in-process side just halts the futile restart-spam.
+      // NOT gated by isApiKeyAuth — that gate is exactly the hole that let integrations-routing
+      // march toward crash #8 on 2026-07-13 (api-key org, so the string rate-limit guard was off).
+      // Two independent impls of one locked golden vector (restart-ineffective-golden.json):
+      // this .ts + the wedge-watchdog .mjs — same verdict, independent failure modes.
+      const ineff = classifyRestartIneffective({
+        restartsLog: this.readLogLinesTail(name, 'restarts.log'),
+        crashesLog: this.readLogLinesTail(name, 'crashes.log'),
+        heartbeatJson: { last_heartbeat: hb.last_heartbeat },
+        nowMs: Date.now(),
+      });
+      if (ineff.ineffective) {
+        const riKey = `restart-ineffective-${name}`;
+        if (Date.now() - (this.lastLogAt.get(riKey) ?? 0) > 30 * 60 * 1000) {
+          console.warn(
+            `[watchdog] ${name} RESTART-INEFFECTIVE — ${ineff.streak} consecutive stale restarts ` +
+            `(newest session ${ineff.newestSessionId}) with NO heartbeat advance. A restart cannot ` +
+            `fix this (auth-loss/credit-hold/429). PAUSING restarts + NOT counting toward crash-halt; ` +
+            `recovery is the out-of-process re-auth escalation. Auto-resumes when the heartbeat advances.`,
+          );
+          this.lastLogAt.set(riKey, Date.now());
+        }
+        continue;
+      }
+
       // --- Restart ---
 
       // Enforce restart cooldown
@@ -619,6 +653,30 @@ export class StaleAgentWatchdog {
       return buffer.toString('utf-8').replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Read the last `maxLines` lines of an agent log file (restarts.log / crashes.log)
+   * as an array, for the restart-ineffective classifier. Bounded (tail of a byte
+   * window) so a huge log never blows the check tick. Returns [] on any error —
+   * a guard must never throw into the restart loop.
+   */
+  private readLogLinesTail(agentName: string, filename: string, maxLines = 200): string[] {
+    try {
+      const p = join(this.ctxRoot, 'logs', agentName, filename);
+      if (!existsSync(p)) return [];
+      const stats = statSync(p);
+      if (stats.size === 0) return [];
+      const readSize = Math.min(stats.size, 65536);
+      const fd = openSync(p, 'r');
+      const buffer = Buffer.alloc(readSize);
+      readSync(fd, buffer, 0, readSize, stats.size - readSize);
+      closeSync(fd);
+      const lines = buffer.toString('utf-8').split('\n').filter((l) => l.trim() !== '');
+      return lines.slice(-maxLines);
+    } catch {
+      return [];
     }
   }
 
